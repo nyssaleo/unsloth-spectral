@@ -67,6 +67,22 @@ def create_spectral_forward(
         5. Returns output in Unsloth-compatible format (standard)
         """
         
+        # Get architecture parameters (compatible with Unsloth/Mistral)
+        # Mistral stores these in config, not directly on attention module
+        if hasattr(self, 'config'):
+            num_heads = self.config.num_attention_heads
+            num_key_value_heads = self.config.num_key_value_heads
+            head_dim = self.config.hidden_size // num_heads
+            hidden_size = self.config.hidden_size
+            num_key_value_groups = num_heads // num_key_value_heads
+        else:
+            # Fallback for other architectures
+            num_heads = self.num_heads
+            num_key_value_heads = self.num_key_value_heads
+            head_dim = self.head_dim
+            hidden_size = self.hidden_size
+            num_key_value_groups = self.num_key_value_groups
+        
         bsz, q_len, _ = hidden_states.size()
         
         # 1. QKV Projection (Standard Unsloth path)
@@ -76,9 +92,9 @@ def create_spectral_forward(
         value_states = self.v_proj(hidden_states)
         
         # Reshape to [B, H, T, D]
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         
         # 2. RoPE (Rotary Positional Embeddings)
         # =========================================
@@ -87,9 +103,9 @@ def create_spectral_forward(
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
         # If we're using GQA (Grouped Query Attention), repeat K/V heads
-        if self.num_key_value_groups > 1:
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
+        if num_key_value_groups > 1:
+            key_states = repeat_kv(key_states, num_key_value_groups)
+            value_states = repeat_kv(value_states, num_key_value_groups)
         
         # 3. Spectral Cache Management
         # ===============================
@@ -98,8 +114,8 @@ def create_spectral_forward(
         if not isinstance(past_key_value, SpectralCache):
             # First call or tuple-based cache - create SpectralCache
             cache = SpectralCache(
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
+                num_heads=num_heads,
+                head_dim=head_dim,
                 block_size=block_size,
                 k_rank_keys=k_rank_keys,
                 k_rank_values=k_rank_values,
@@ -133,12 +149,12 @@ def create_spectral_forward(
                     Q=query_states,
                     cache=past_key_value,
                     attention_mask=attention_mask,
-                    scale=1.0 / math.sqrt(self.head_dim),
+                    scale=1.0 / math.sqrt(head_dim),
                 )
             else:
                 # Prefill: use standard attention with reconstructed K/V
                 K_full, V_full = past_key_value.get_kv()
-                attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+                attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
                 
                 if attention_mask is not None:
                     attn_weights = attn_weights + attention_mask
@@ -148,7 +164,7 @@ def create_spectral_forward(
         else:
             # Standard attention (for short contexts or validation)
             K_full, V_full = past_key_value.get_kv()
-            attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
             
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask
@@ -159,7 +175,7 @@ def create_spectral_forward(
         # 5. Output Projection (Standard)
         # =================================
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, hidden_size)
         attn_output = self.o_proj(attn_output)
         
         return attn_output, None, past_key_value if use_cache else None
