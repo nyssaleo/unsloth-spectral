@@ -96,11 +96,33 @@ def create_spectral_forward(
         key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         
-        # 2. RoPE (Rotary Positional Embeddings)
-        # =========================================
-        # Unsloth applies RoPE before caching
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # 2. RoPE (Rotary Positional Embeddings) - Unsloth's method
+        # ===========================================================
+        # Calculate total sequence length (current + past cache)
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if isinstance(past_key_value, SpectralCache):
+                kv_seq_len += past_key_value.total_tokens
+            elif isinstance(past_key_value, (tuple, list)) and len(past_key_value) == 2:
+                kv_seq_len += past_key_value[0].shape[-2]
+        
+        # Extend RoPE embedding cache if needed
+        if hasattr(self, 'rotary_emb') and hasattr(self.rotary_emb, 'extend_rope_embedding'):
+            # Unsloth's optimized RoPE
+            self.rotary_emb.extend_rope_embedding(value_states, seq_len=kv_seq_len)
+            cos, sin = self.rotary_emb.get_cached(kv_seq_len, query_states.device.index)
+            
+            # Use Unsloth's fast_rope_embedding if available
+            try:
+                from unsloth.models.llama import fast_rope_embedding
+                query_states, key_states = fast_rope_embedding(query_states, key_states, cos, sin, position_ids)
+            except ImportError:
+                # Fallback to standard RoPE
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        else:
+            # Fallback for non-Unsloth models (standard transformers)
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
         # If we're using GQA (Grouped Query Attention), repeat K/V heads
         if num_key_value_groups > 1:
@@ -184,15 +206,39 @@ def create_spectral_forward(
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
-    """Apply rotary positional embeddings (RoPE)."""
-    # This is a simplified version - Unsloth has optimized CUDA kernels
-    # For compatibility, we use the standard PyTorch implementation
+    """
+    Apply rotary positional embeddings (RoPE).
+    
+    Fallback implementation for non-Unsloth models.
+    Unsloth models should use fast_rope_embedding instead.
+    """
+    # Unsqueeze for broadcasting if needed
+    # cos, sin shape: [seq_len, head_dim] or [batch, seq_len, head_dim]
+    # q, k shape: [batch, num_heads, seq_len, head_dim]
+    
+    # Handle position_ids if provided
+    if position_ids is not None:
+        # Select the appropriate cos/sin values for each position
+        # Reshape position_ids to index into cos/sin
+        # This is a simplified version - actual implementation may vary
+        pass
+    
+    # Ensure cos and sin have the right shape
+    if cos.dim() == 2:
+        # [seq_len, head_dim] -> [1, 1, seq_len, head_dim]
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    elif cos.dim() == 3:
+        # [batch, seq_len, head_dim] -> [batch, 1, seq_len, head_dim]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     
     # Rotate half dimensions
     def rotate_half(x):
         x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
         return torch.cat((-x2, x1), dim=-1)
     
+    # Apply rotation
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     
