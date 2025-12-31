@@ -6,6 +6,7 @@ identify which function Unsloth uses for decode steps (q_len=1).
 """
 
 import torch
+import torch.nn
 from unsloth import FastLanguageModel
 import sys
 
@@ -38,15 +39,24 @@ def instrument_model(model):
         if hasattr(layer, 'self_attn'):
             attn = layer.self_attn
             
-            # Find all callable methods
+            # Find all callable methods (but skip nn.Module submodules)
             for attr_name in dir(attn):
                 if attr_name.startswith('_'):
                     continue
                 attr = getattr(attn, attr_name)
+                
+                # Skip if it's an nn.Module (like q_proj, k_proj, etc.)
+                if isinstance(attr, torch.nn.Module):
+                    continue
+                
                 if callable(attr) and not isinstance(attr, type):
-                    # Wrap it
-                    wrapped = trace_wrapper(attr, f"Layer{layer_idx}.{attr_name}")
-                    setattr(attn, attr_name, wrapped)
+                    # Only wrap if it's a bound method, not a module
+                    try:
+                        wrapped = trace_wrapper(attr, f"Layer{layer_idx}.{attr_name}")
+                        setattr(attn, attr_name, wrapped)
+                    except TypeError:
+                        # Skip if we can't wrap it
+                        pass
     
     print(f"✅ Instrumented all attention layers")
     print("="*70)
