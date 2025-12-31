@@ -1,0 +1,6 @@
+torch>=2.0.0
+numpy>=1.24.0
+# unsloth - install separately based on environment:
+# For Colab: pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+# For local: pip install unsloth
+

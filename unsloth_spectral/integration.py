@@ -1,0 +1,293 @@
+"""
+Unsloth Integration: Monkey-patching for Spectral Cache
+
+This module provides seamless integration with Unsloth's optimized Mistral implementation.
+It monkey-patches the MistralAttention_fast_forward method to use SpectralCache instead
+of standard tuple-based KV cache.
+
+Key Design: The patched forward method is a drop-in replacement that:
+1. Detects if past_key_value is a SpectralCache
+2. Converts tuple caches to SpectralCache automatically
+3. Uses spectral_attention_forward for computation
+4. Returns compatible outputs for model.generate()
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import Optional, Tuple
+from .spectral_cache import SpectralCache
+from .spectral_attention import spectral_attention_forward
+import math
+
+
+def create_spectral_forward(
+    original_forward,
+    block_size: int = 512,
+    k_rank_keys: int = 16,
+    k_rank_values: int = 32,
+    hot_buffer_size: int = 64,
+    use_spectral_attention: bool = True,
+):
+    """
+    Factory function that creates a spectral-enabled forward method.
+    
+    This wraps the original MistralAttention forward to inject spectral cache logic.
+    
+    Args:
+        original_forward: Original self.forward method
+        block_size: Tokens per compressed block
+        k_rank_keys: Spectral rank for Keys
+        k_rank_values: Spectral rank for Values
+        hot_buffer_size: Number of recent tokens kept uncompressed
+        use_spectral_attention: If True, use direct spectral attention (no reconstruction)
+        
+    Returns:
+        spectral_forward: Modified forward method with spectral cache
+    """
+    
+    def spectral_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Modified forward pass with spectral cache integration.
+        
+        This method:
+        1. Computes Q, K, V projections (standard)
+        2. Applies RoPE to Q, K (standard)
+        3. Manages SpectralCache (new)
+        4. Computes attention using spectral method (new)
+        5. Returns output in Unsloth-compatible format (standard)
+        """
+        
+        bsz, q_len, _ = hidden_states.size()
+        
+        # 1. QKV Projection (Standard Unsloth path)
+        # ============================================
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        
+        # Reshape to [B, H, T, D]
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        # 2. RoPE (Rotary Positional Embeddings)
+        # =========================================
+        # Unsloth applies RoPE before caching
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        # If we're using GQA (Grouped Query Attention), repeat K/V heads
+        if self.num_key_value_groups > 1:
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        # 3. Spectral Cache Management
+        # ===============================
+        
+        # Check if past_key_value is already a SpectralCache
+        if not isinstance(past_key_value, SpectralCache):
+            # First call or tuple-based cache - create SpectralCache
+            cache = SpectralCache(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                block_size=block_size,
+                k_rank_keys=k_rank_keys,
+                k_rank_values=k_rank_values,
+                hot_buffer_size=hot_buffer_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            
+            # If there was a previous tuple cache, initialize with it
+            if past_key_value is not None and isinstance(past_key_value, (tuple, list)):
+                if len(past_key_value) == 2:
+                    past_K, past_V = past_key_value
+                    cache.append(past_K, past_V)
+            
+            past_key_value = cache
+        
+        # Append new K, V to cache
+        past_key_value.append(key_states, value_states)
+        
+        # 4. Attention Computation
+        # ==========================
+        
+        if use_spectral_attention and past_key_value.total_tokens > block_size:
+            # Use spectral attention (no reconstruction)
+            # This is the core optimization!
+            
+            # Note: spectral_attention currently only supports single-token decode
+            # For prefill (q_len > 1), we fall back to standard attention
+            if q_len == 1:
+                attn_output = spectral_attention_forward(
+                    Q=query_states,
+                    cache=past_key_value,
+                    attention_mask=attention_mask,
+                    scale=1.0 / math.sqrt(self.head_dim),
+                )
+            else:
+                # Prefill: use standard attention with reconstructed K/V
+                K_full, V_full = past_key_value.get_kv()
+                attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+                
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                
+                attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_output = torch.matmul(attn_weights, V_full)
+        else:
+            # Standard attention (for short contexts or validation)
+            K_full, V_full = past_key_value.get_kv()
+            attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(self.head_dim)
+            
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, V_full)
+        
+        # 5. Output Projection (Standard)
+        # =================================
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output, None, past_key_value if use_cache else None
+    
+    return spectral_forward
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
+    """Apply rotary positional embeddings (RoPE)."""
+    # This is a simplified version - Unsloth has optimized CUDA kernels
+    # For compatibility, we use the standard PyTorch implementation
+    
+    # Rotate half dimensions
+    def rotate_half(x):
+        x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+    
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeat K/V heads for Grouped Query Attention (GQA).
+    
+    This is equivalent to torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def patch_unsloth_attention(
+    model,
+    block_size: int = 512,
+    k_rank_keys: int = 16,
+    k_rank_values: int = 32,
+    hot_buffer_size: int = 64,
+    use_spectral_attention: bool = True,
+    verbose: bool = True,
+):
+    """
+    Monkey-patch all attention layers in an Unsloth model to use SpectralCache.
+    
+    This modifies the model in-place, replacing the forward methods of all
+    MistralAttention layers with spectral-enabled versions.
+    
+    Args:
+        model: Unsloth FastLanguageModel
+        block_size: Tokens per compressed block
+        k_rank_keys: Spectral rank for Keys
+        k_rank_values: Spectral rank for Values  
+        hot_buffer_size: Recent tokens kept uncompressed
+        use_spectral_attention: Use direct spectral attention (recommended: True)
+        verbose: Print patching confirmation
+        
+    Returns:
+        model: Modified model (in-place)
+    """
+    
+    num_patched = 0
+    
+    # Patch all transformer layers
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer, 'self_attn'):
+            # Get the original forward method
+            original_forward = layer.self_attn.forward
+            
+            # Create spectral version
+            spectral_fwd = create_spectral_forward(
+                original_forward=original_forward,
+                block_size=block_size,
+                k_rank_keys=k_rank_keys,
+                k_rank_values=k_rank_values,
+                hot_buffer_size=hot_buffer_size,
+                use_spectral_attention=use_spectral_attention,
+            )
+            
+            # Monkey-patch (bind to instance)
+            layer.self_attn.forward = spectral_fwd.__get__(layer.self_attn, type(layer.self_attn))
+            num_patched += 1
+    
+    if verbose:
+        print(f"✅ Patched {num_patched} attention layers with SpectralCache")
+        print(f"   Config: block_size={block_size}, k_K={k_rank_keys}, k_V={k_rank_values}")
+        print(f"   Spectral Attention: {'Enabled' if use_spectral_attention else 'Disabled (validation mode)'}")
+    
+    return model
+
+
+def get_cache_stats(model):
+    """
+    Extract cache statistics from all layers.
+    
+    Returns:
+        dict: Aggregated cache statistics
+    """
+    total_tokens = 0
+    total_blocks = 0
+    total_original_bytes = 0
+    total_compressed_bytes = 0
+    
+    for layer in model.model.layers:
+        if hasattr(layer, 'self_attn'):
+            # Check if the layer has been used (has cache)
+            # This would require the model to have been called at least once
+            pass
+    
+    return {
+        "total_tokens": total_tokens,
+        "total_blocks": total_blocks,
+        "compression_ratio": total_original_bytes / total_compressed_bytes if total_compressed_bytes > 0 else 1.0,
+    }
+
+
+if __name__ == "__main__":
+    print("="*60)
+    print("Unsloth Spectral Integration Module")
+    print("="*60)
+    print("\nThis module provides monkey-patching for Unsloth models.")
+    print("Usage:")
+    print("  from unsloth_spectral import patch_unsloth_attention")
+    print("  model = FastLanguageModel.from_pretrained(...)")
+    print("  patch_unsloth_attention(model)")
+    print("  # Now model.generate() uses spectral cache!")
+    print("="*60)
+
