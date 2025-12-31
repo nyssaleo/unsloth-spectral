@@ -338,5 +338,5 @@ If you use this work in your research, please cite:
 
 ---
 
-Made with ❤️ by the Unsloth Spectral team
+Made with ❤️ by nyssaleo
 
