@@ -17,6 +17,7 @@ Usage (in Colab):
 import torch
 import time
 import sys
+import gc
 from pathlib import Path
 
 # Ensure library is importable
@@ -191,6 +192,11 @@ def benchmark_generation():
     
     spectral_text = tokenizer.decode(outputs_spectral[0], skip_special_tokens=True)
     
+    # Free spectral model immediately
+    del model_spectral
+    del tokenizer
+    torch.cuda.empty_cache()
+    
     # Comparison
     speedup = baseline_time / spectral_time
     
@@ -235,8 +241,15 @@ def main():
         print("   In Colab: Runtime > Change runtime type > T4 GPU")
         return
     
+    # CRITICAL: Clear GPU memory from previous runs
+    # This prevents contamination when running the benchmark multiple times
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    
     print(f"\n✅ GPU: {torch.cuda.get_device_name()}")
     print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"   💾 GPU cache cleared for clean benchmark")
     
     # Test 1: rSVD
     rsvd_speedup = benchmark_rsvd()
@@ -247,6 +260,12 @@ def main():
     
     if response.lower() == 'y':
         gen_results = benchmark_generation()
+        
+        # CRITICAL: Free models from GPU memory after generation test
+        # This prevents memory leaks in Colab sessions
+        print("\n💾 Clearing GPU memory...")
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         print("Skipping generation benchmark.")
         gen_results = None
