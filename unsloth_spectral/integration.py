@@ -178,28 +178,17 @@ def create_spectral_forward(
         
         past_key_value.append(key_states, value_states)
         
-        # 4. GQA Expansion - AFTER cache storage!
-        # ========================================
-        # If we're using GQA (Grouped Query Attention), repeat K/V heads for attention
-        if num_key_value_groups > 1:
-            if debug_logging:
-                print(f"[SpectralForward] Applying repeat_kv (groups={num_key_value_groups})")
-            key_states = repeat_kv(key_states, num_key_value_groups)
-            value_states = repeat_kv(value_states, num_key_value_groups)
-            if debug_logging:
-                print(f"[SpectralForward] After repeat_kv:")
-                print(f"  K shape: {key_states.shape} (expanded to {num_heads} heads)")
-                print(f"  V shape: {value_states.shape}")
-        
-        # 5. Attention Computation
+        # 4. Attention Computation
         # ==========================
+        # NOTE: GQA expansion happens AFTER retrieving full context from cache,
+        # not here! We need to expand the COMPLETE history (past + current),
+        # not just the current tokens.
         
         if debug_logging:
             print(f"[SpectralForward] Before attention:")
             print(f"  Q shape: {query_states.shape}")
-            print(f"  K shape (for attention): {key_states.shape}")
-            print(f"  V shape (for attention): {value_states.shape}")
             print(f"  Cache total tokens: {past_key_value.total_tokens}")
+            print(f"  Note: K/V will be retrieved and expanded from cache during attention")
         
         if use_spectral_attention and past_key_value.total_tokens > block_size:
             # Use spectral attention (no reconstruction)
@@ -217,6 +206,17 @@ def create_spectral_forward(
             else:
                 # Prefill: use standard attention with reconstructed K/V
                 K_full, V_full = past_key_value.get_kv()
+                
+                # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
+                if num_key_value_groups > 1:
+                    if debug_logging:
+                        print(f"[SpectralForward] Expanding K_full/V_full for GQA:")
+                        print(f"  Before: K_full {K_full.shape}, V_full {V_full.shape}")
+                    K_full = repeat_kv(K_full, num_key_value_groups)
+                    V_full = repeat_kv(V_full, num_key_value_groups)
+                    if debug_logging:
+                        print(f"  After: K_full {K_full.shape}, V_full {V_full.shape}")
+                
                 attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
                 
                 if attention_mask is not None:
@@ -227,6 +227,17 @@ def create_spectral_forward(
         else:
             # Standard attention (for short contexts or validation)
             K_full, V_full = past_key_value.get_kv()
+            
+            # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
+            if num_key_value_groups > 1:
+                if debug_logging:
+                    print(f"[SpectralForward] Expanding K_full/V_full for GQA (standard path):")
+                    print(f"  Before: K_full {K_full.shape}, V_full {V_full.shape}")
+                K_full = repeat_kv(K_full, num_key_value_groups)
+                V_full = repeat_kv(V_full, num_key_value_groups)
+                if debug_logging:
+                    print(f"  After: K_full {K_full.shape}, V_full {V_full.shape}")
+            
             attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
             
             if attention_mask is not None:
