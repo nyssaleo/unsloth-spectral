@@ -362,6 +362,182 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def create_spectral_forward_inference(
+    block_size: int = 512,
+    k_rank_keys: int = 16,
+    k_rank_values: int = 32,
+    hot_buffer_size: int = 64,
+    use_spectral_attention: bool = True,
+    debug_logging: bool = False,
+):
+    """
+    Creates a spectral-enabled inference forward function for decode steps.
+    
+    This replaces Unsloth's LlamaAttention_fast_forward_inference to use
+    spectral compression during single-token decode.
+    
+    Args:
+        block_size: Tokens per compressed block
+        k_rank_keys: Spectral rank for Keys
+        k_rank_values: Spectral rank for Values
+        hot_buffer_size: Number of recent tokens kept uncompressed
+        use_spectral_attention: If True, use direct spectral attention
+        debug_logging: Enable detailed logging
+        
+    Returns:
+        spectral_forward_inference: Modified inference function
+    """
+    
+    def spectral_forward_inference(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor]],
+        position_ids: torch.LongTensor,
+        do_prefill: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Fast inference using spectral KV cache for single-token decode.
+        
+        This is the decode-path equivalent of spectral_forward.
+        Instead of reconstructing the full K/V cache, it performs attention
+        directly in the spectral space using dual projection.
+        """
+        if debug_logging:
+            print(f"\n{'='*80}\n[SpectralInference] DECODE STEP - Layer {getattr(self, 'layer_idx', 'N/A')}")
+            print(f"  hidden_states: {hidden_states.shape}")
+            print(f"  past_key_value type: {type(past_key_value)}")
+            print(f"  do_prefill: {do_prefill}")
+        
+        bsz, q_len, hidden_dim = hidden_states.size()
+        assert q_len == 1, f"Inference path expects q_len=1, got {q_len}"
+        
+        # Get attention parameters
+        num_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+        head_dim = self.head_dim
+        num_key_value_groups = num_heads // num_key_value_heads
+        
+        # QKV projection
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        
+        # Reshape
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        
+        if debug_logging:
+            print(f"  After QKV projection:")
+            print(f"    Q: {query_states.shape}")
+            print(f"    K: {key_states.shape}")
+            print(f"    V: {value_states.shape}")
+        
+        # Initialize or get cache
+        if not isinstance(past_key_value, SpectralCache):
+            if debug_logging:
+                print(f"  Creating new SpectralCache (do_prefill={do_prefill})")
+            
+            cache = SpectralCache(
+                num_heads=num_key_value_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                k_rank_keys=k_rank_keys,
+                k_rank_values=k_rank_values,
+                hot_buffer_size=hot_buffer_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+                debug_logging=debug_logging,
+            )
+            
+            # If we received a tuple cache, initialize from it
+            if isinstance(past_key_value, (tuple, list)) and len(past_key_value) == 2:
+                past_K, past_V = past_key_value
+                if debug_logging:
+                    print(f"  Initializing from tuple: K {past_K.shape}, V {past_V.shape}")
+                cache.append(past_K, past_V)
+            
+            past_key_value = cache
+        
+        # Calculate kv_seq_len for RoPE
+        kv_seq_len = key_states.shape[-2] + past_key_value.total_tokens
+        
+        if debug_logging:
+            print(f"  RoPE: kv_seq_len={kv_seq_len}")
+        
+        # Apply RoPE (Unsloth's method)
+        if hasattr(self, 'rotary_emb') and hasattr(self.rotary_emb, 'extend_rope_embedding'):
+            self.rotary_emb.extend_rope_embedding(value_states, seq_len=kv_seq_len)
+            cos, sin = self.rotary_emb.get_cached(kv_seq_len, query_states.device.index)
+            
+            try:
+                from unsloth.models.llama import fast_rope_embedding
+                query_states, key_states = fast_rope_embedding(query_states, key_states, cos, sin, position_ids)
+            except ImportError:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        else:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        # Append new K/V to cache (BEFORE GQA expansion!)
+        if debug_logging:
+            print(f"  Appending to cache: K {key_states.shape}, V {value_states.shape}")
+        
+        past_key_value.append(key_states, value_states)
+        
+        # Now perform attention
+        if use_spectral_attention and past_key_value.total_tokens > block_size:
+            # Use spectral attention (direct projection)
+            if debug_logging:
+                print(f"  Using spectral attention (total_tokens={past_key_value.total_tokens})")
+            
+            attn_output = spectral_attention_forward(
+                Q=query_states,
+                cache=past_key_value,
+                attention_mask=attention_mask,
+                scale=1.0 / math.sqrt(head_dim),
+                debug_logging=debug_logging,
+            )
+        else:
+            # Standard attention with reconstructed K/V
+            if debug_logging:
+                print(f"  Using standard attention (total_tokens={past_key_value.total_tokens})")
+            
+            K_full, V_full = past_key_value.get_kv()
+            
+            # GQA expansion (after cache retrieval)
+            if num_key_value_groups > 1:
+                if debug_logging:
+                    print(f"  Expanding for GQA: {K_full.shape} → groups={num_key_value_groups}")
+                K_full = repeat_kv(K_full, num_key_value_groups)
+                V_full = repeat_kv(V_full, num_key_value_groups)
+            
+            # Attention computation
+            attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
+            
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, V_full)
+        
+        # Output projection
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, num_heads * head_dim)
+        attn_output = self.o_proj(attn_output)
+        
+        if debug_logging:
+            print(f"  Output: {attn_output.shape}")
+            print(f"  Returning SpectralCache with {past_key_value.total_tokens} tokens")
+            print(f"{'='*80}\n")
+        
+        # Return output and updated cache (as tuple for Unsloth compatibility)
+        return attn_output, past_key_value
+    
+    return spectral_forward_inference
+
+
 def patch_unsloth_attention(
     model,
     block_size: int = 512,
@@ -413,6 +589,31 @@ def patch_unsloth_attention(
             # Monkey-patch (bind to instance)
             layer.self_attn.forward = spectral_fwd.__get__(layer.self_attn, type(layer.self_attn))
             num_patched += 1
+    
+    # CRITICAL: Also patch the INFERENCE function for decode path!
+    # Unsloth uses a separate fast_forward_inference function for single-token decode
+    # that bypasses the regular forward. We need to patch that too.
+    try:
+        import unsloth.models.llama as llama_module
+        
+        # Create the spectral inference function
+        spectral_inference_fn = create_spectral_forward_inference(
+            block_size=block_size,
+            k_rank_keys=k_rank_keys,
+            k_rank_values=k_rank_values,
+            hot_buffer_size=hot_buffer_size,
+            use_spectral_attention=use_spectral_attention,
+            debug_logging=debug_logging,
+        )
+        
+        # Monkey-patch the module-level function
+        llama_module.LlamaAttention_fast_forward_inference = spectral_inference_fn
+        
+        if verbose:
+            print(f"✅ Patched decode inference path (LlamaAttention_fast_forward_inference)")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not patch inference function: {e}")
+        print(f"   Decode steps may not use spectral cache correctly.")
     
     if verbose:
         print(f"✅ Patched {num_patched} attention layers with SpectralCache")
