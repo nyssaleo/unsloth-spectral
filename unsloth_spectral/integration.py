@@ -155,6 +155,7 @@ def create_spectral_forward(
                 hot_buffer_size=hot_buffer_size,
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
+                debug_logging=debug_logging,  # Pass debug flag to cache
             )
             
             # If there was a previous tuple cache, initialize with it
@@ -205,17 +206,27 @@ def create_spectral_forward(
                 )
             else:
                 # Prefill: use standard attention with reconstructed K/V
+                if debug_logging:
+                    print(f"\n[SpectralForward] Prefill path - retrieving full context from cache")
+                
                 K_full, V_full = past_key_value.get_kv()
+                
+                if debug_logging:
+                    print(f"[SpectralForward] Retrieved from cache:")
+                    print(f"  K_full: {K_full.shape if K_full is not None else 'None'}")
+                    print(f"  V_full: {V_full.shape if V_full is not None else 'None'}")
                 
                 # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
                 if num_key_value_groups > 1:
                     if debug_logging:
-                        print(f"[SpectralForward] Expanding K_full/V_full for GQA:")
-                        print(f"  Before: K_full {K_full.shape}, V_full {V_full.shape}")
+                        print(f"[SpectralForward] Expanding K_full/V_full for GQA (groups={num_key_value_groups}):")
+                        print(f"  Before expansion: K_full {K_full.shape}, V_full {V_full.shape}")
                     K_full = repeat_kv(K_full, num_key_value_groups)
                     V_full = repeat_kv(V_full, num_key_value_groups)
                     if debug_logging:
-                        print(f"  After: K_full {K_full.shape}, V_full {V_full.shape}")
+                        print(f"  After expansion: K_full {K_full.shape}, V_full {V_full.shape}")
+                        print(f"  Q shape for comparison: {query_states.shape}")
+                        print(f"  Head dimension match: Q[{query_states.shape[1]}] == K[{K_full.shape[1]}]? {query_states.shape[1] == K_full.shape[1]}")
                 
                 attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
                 
@@ -226,17 +237,27 @@ def create_spectral_forward(
                 attn_output = torch.matmul(attn_weights, V_full)
         else:
             # Standard attention (for short contexts or validation)
+            if debug_logging:
+                print(f"\n[SpectralForward] Standard attention path - retrieving full context from cache")
+            
             K_full, V_full = past_key_value.get_kv()
+            
+            if debug_logging:
+                print(f"[SpectralForward] Retrieved from cache:")
+                print(f"  K_full: {K_full.shape if K_full is not None else 'None'}")
+                print(f"  V_full: {V_full.shape if V_full is not None else 'None'}")
             
             # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
             if num_key_value_groups > 1:
                 if debug_logging:
-                    print(f"[SpectralForward] Expanding K_full/V_full for GQA (standard path):")
-                    print(f"  Before: K_full {K_full.shape}, V_full {V_full.shape}")
+                    print(f"[SpectralForward] Expanding K_full/V_full for GQA (groups={num_key_value_groups}):")
+                    print(f"  Before expansion: K_full {K_full.shape}, V_full {V_full.shape}")
                 K_full = repeat_kv(K_full, num_key_value_groups)
                 V_full = repeat_kv(V_full, num_key_value_groups)
                 if debug_logging:
-                    print(f"  After: K_full {K_full.shape}, V_full {V_full.shape}")
+                    print(f"  After expansion: K_full {K_full.shape}, V_full {V_full.shape}")
+                    print(f"  Q shape for comparison: {query_states.shape}")
+                    print(f"  Head dimension match: Q[{query_states.shape[1]}] == K[{K_full.shape[1]}]? {query_states.shape[1] == K_full.shape[1]}")
             
             attn_weights = torch.matmul(query_states, K_full.transpose(2, 3)) / math.sqrt(head_dim)
             
@@ -251,6 +272,13 @@ def create_spectral_forward(
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, hidden_size)
         attn_output = self.o_proj(attn_output)
+        
+        if debug_logging:
+            print(f"\n[SpectralForward] Forward pass complete:")
+            print(f"  Final attn_output: {attn_output.shape}")
+            print(f"  Returning cache with {past_key_value.total_tokens} total tokens")
+            print(f"  Cache state: {len(past_key_value.cold_blocks)} cold blocks, {past_key_value.hot_K.shape[2] if past_key_value.hot_K is not None else 0} hot tokens")
+            print(f"=" * 80)
         
         # Store cache reference for get_cache_stats()
         if use_cache and isinstance(past_key_value, SpectralCache):

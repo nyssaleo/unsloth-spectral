@@ -64,6 +64,7 @@ class SpectralCache:
         hot_buffer_size: Number of recent tokens kept uncompressed (default: 64)
         device: Torch device
         dtype: Data type for uncompressed cache (default: float16)
+        debug_logging: Enable detailed logging for debugging
     """
     
     def __init__(
@@ -76,6 +77,7 @@ class SpectralCache:
         hot_buffer_size: int = 64,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        debug_logging: bool = False,
     ):
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -85,6 +87,7 @@ class SpectralCache:
         self.hot_buffer_size = hot_buffer_size
         self.device = device
         self.dtype = dtype
+        self.debug_logging = debug_logging
         
         # Three-tier cache
         self.hot_K: Optional[torch.Tensor] = None  # [B, H, T_hot, D]
@@ -94,6 +97,14 @@ class SpectralCache:
         # State tracking
         self.total_tokens = 0
         self.compression_count = 0
+        
+        if self.debug_logging:
+            print(f"[SpectralCache.__init__] Created cache:")
+            print(f"  num_heads={num_heads} (KV heads)")
+            print(f"  head_dim={head_dim}")
+            print(f"  block_size={block_size}")
+            print(f"  k_rank_keys={k_rank_keys}, k_rank_values={k_rank_values}")
+            print(f"  hot_buffer_size={hot_buffer_size}")
     
     def append(self, K_new: torch.Tensor, V_new: torch.Tensor):
         """
@@ -105,19 +116,35 @@ class SpectralCache:
             K_new: New keys [B, H, T_new, D]
             V_new: New values [B, H, T_new, D]
         """
+        if self.debug_logging:
+            print(f"\n[SpectralCache.append] Incoming K/V:")
+            print(f"  K_new shape: {K_new.shape}")
+            print(f"  V_new shape: {V_new.shape}")
+            print(f"  Before append: total_tokens={self.total_tokens}, hot_tokens={self.hot_K.shape[2] if self.hot_K is not None else 0}")
+        
         # First append: Initialize hot cache
         if self.hot_K is None:
             self.hot_K = K_new
             self.hot_V = V_new
+            if self.debug_logging:
+                print(f"  Action: Initialized hot cache")
         else:
             # Concatenate along sequence dimension
+            old_hot_size = self.hot_K.shape[2]
             self.hot_K = torch.cat([self.hot_K, K_new], dim=2)
             self.hot_V = torch.cat([self.hot_V, V_new], dim=2)
+            if self.debug_logging:
+                print(f"  Action: Concatenated ({old_hot_size} + {K_new.shape[2]} = {self.hot_K.shape[2]} hot tokens)")
         
         self.total_tokens += K_new.shape[2]
         
+        if self.debug_logging:
+            print(f"  After append: total_tokens={self.total_tokens}, hot_tokens={self.hot_K.shape[2]}, cold_blocks={len(self.cold_blocks)}")
+        
         # Trigger compression if hot cache is large enough
         if self.hot_K.shape[2] >= self.block_size:
+            if self.debug_logging:
+                print(f"  Triggering compression (hot_tokens={self.hot_K.shape[2]} >= block_size={self.block_size})")
             self._compress_hot_cache()
     
     def _compress_hot_cache(self):
@@ -348,15 +375,24 @@ class SpectralCache:
             K_full: Reconstructed keys [B, H, T_total, D]
             V_full: Reconstructed values [B, H, T_total, D]
         """
+        if self.debug_logging:
+            print(f"\n[SpectralCache.get_kv] Reconstructing full K/V:")
+            print(f"  Cold blocks: {len(self.cold_blocks)}")
+            print(f"  Hot tokens: {self.hot_K.shape[2] if self.hot_K is not None else 0}")
+            print(f"  Total tokens: {self.total_tokens}")
+        
         K_parts = []
         V_parts = []
         
         # Reconstruct cold blocks
-        for block in self.cold_blocks:
+        for i, block in enumerate(self.cold_blocks):
             # K_recon = coeffs_K @ basis_K
             # Shape: [H, T, k] @ [H, k, D] -> [H, T, D]
             K_block = torch.bmm(block.coeffs_K, block.basis_K)  # [H, T, D]
             V_block = torch.bmm(block.coeffs_V, block.basis_V)
+            
+            if self.debug_logging:
+                print(f"  Block {i}: coeffs_K {block.coeffs_K.shape} @ basis_K {block.basis_K.shape} → K_block {K_block.shape}")
             
             # Add batch dimension: [H, T, D] -> [1, H, T, D]
             K_parts.append(K_block.unsqueeze(0))
@@ -366,14 +402,22 @@ class SpectralCache:
         if self.hot_K is not None:
             K_parts.append(self.hot_K)
             V_parts.append(self.hot_V)
+            if self.debug_logging:
+                print(f"  Hot cache: K {self.hot_K.shape}, V {self.hot_V.shape}")
         
         if len(K_parts) == 0:
             # Empty cache
+            if self.debug_logging:
+                print(f"  Result: Empty cache!")
             return None, None
         
         # Concatenate along sequence dimension
         K_full = torch.cat(K_parts, dim=2)  # [B, H, T_total, D]
         V_full = torch.cat(V_parts, dim=2)
+        
+        if self.debug_logging:
+            print(f"  Result: K_full {K_full.shape}, V_full {V_full.shape}")
+            print(f"  Verification: {K_full.shape[2]} tokens == total_tokens {self.total_tokens}? {K_full.shape[2] == self.total_tokens}")
         
         return K_full, V_full
     
