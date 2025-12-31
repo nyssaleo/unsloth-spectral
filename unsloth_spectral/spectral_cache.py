@@ -424,6 +424,37 @@ class SpectralCache:
         """Return total number of tokens in cache."""
         return self.total_tokens
     
+    def __getitem__(self, index):
+        """
+        Make SpectralCache subscriptable for Unsloth compatibility.
+        
+        Unsloth expects: past_key_values[layer_idx][0] for K, [1] for V
+        
+        Args:
+            index: 0 for Keys, 1 for Values
+            
+        Returns:
+            torch.Tensor: Reconstructed K or V tensor
+        """
+        if index == 0:
+            K, _ = self.get_kv()
+            return K
+        elif index == 1:
+            _, V = self.get_kv()
+            return V
+        else:
+            raise IndexError(f"SpectralCache subscript index out of range: {index} (expected 0 or 1)")
+    
+    def __iter__(self):
+        """
+        Make SpectralCache iterable for tuple unpacking.
+        
+        Allows: K, V = cache
+        """
+        K, V = self.get_kv()
+        yield K
+        yield V
+    
     def __repr__(self):
         stats = self.get_memory_stats()
         return (

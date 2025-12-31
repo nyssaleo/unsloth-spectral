@@ -200,6 +200,10 @@ def create_spectral_forward(
         attn_output = attn_output.reshape(bsz, q_len, hidden_size)
         attn_output = self.o_proj(attn_output)
         
+        # Store cache reference for get_cache_stats()
+        if use_cache and isinstance(past_key_value, SpectralCache):
+            self._spectral_cache = past_key_value
+        
         return attn_output, None, past_key_value if use_cache else None
     
     return spectral_forward
@@ -318,26 +322,50 @@ def patch_unsloth_attention(
 
 def get_cache_stats(model):
     """
-    Extract cache statistics from all layers.
+    Extract cache statistics from all layers that have been used.
+    
+    Note: Only collects stats from layers that have processed at least one forward pass
+    with spectral cache enabled.
     
     Returns:
-        dict: Aggregated cache statistics
+        dict: Aggregated cache statistics including:
+            - total_tokens: Total tokens across all layers
+            - total_blocks: Total compressed blocks
+            - compression_ratio: Average compression ratio
+            - per_layer_stats: List of per-layer statistics
     """
     total_tokens = 0
     total_blocks = 0
     total_original_bytes = 0
     total_compressed_bytes = 0
+    per_layer_stats = []
     
-    for layer in model.model.layers:
-        if hasattr(layer, 'self_attn'):
-            # Check if the layer has been used (has cache)
-            # This would require the model to have been called at least once
-            pass
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_spectral_cache'):
+            cache = layer.self_attn._spectral_cache
+            if isinstance(cache, SpectralCache):
+                stats = cache.get_memory_stats()
+                
+                total_tokens += stats['total_tokens']
+                total_blocks += stats['num_blocks']
+                total_original_bytes += stats['original_bytes']
+                total_compressed_bytes += stats['compressed_bytes']
+                
+                per_layer_stats.append({
+                    'layer_idx': layer_idx,
+                    'tokens': stats['total_tokens'],
+                    'blocks': stats['num_blocks'],
+                    'compression': stats['compression_ratio'],
+                })
     
     return {
         "total_tokens": total_tokens,
         "total_blocks": total_blocks,
+        "total_original_bytes": total_original_bytes,
+        "total_compressed_bytes": total_compressed_bytes,
         "compression_ratio": total_original_bytes / total_compressed_bytes if total_compressed_bytes > 0 else 1.0,
+        "layers_with_cache": len(per_layer_stats),
+        "per_layer_stats": per_layer_stats,
     }
 
 
