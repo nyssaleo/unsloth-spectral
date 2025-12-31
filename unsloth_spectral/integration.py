@@ -86,6 +86,24 @@ def create_spectral_forward(
         
         bsz, q_len, _ = hidden_states.size()
         
+        # 🔍 DIAGNOSTIC: What type is past_key_value when it arrives?
+        if debug_logging:
+            print(f"\n{'='*80}")
+            print(f"[SpectralForward] NEW FORWARD PASS - Layer {getattr(self, 'layer_idx', 'N/A')}")
+            print(f"  q_len: {q_len} (1=decode, >1=prefill)")
+            print(f"  past_key_value type: {type(past_key_value)}")
+            if past_key_value is not None:
+                if isinstance(past_key_value, SpectralCache):
+                    print(f"  ✓ Cache IS SpectralCache, total_tokens={past_key_value.total_tokens}")
+                elif isinstance(past_key_value, (tuple, list)):
+                    print(f"  ⚠️  Cache is tuple/list, len={len(past_key_value)}")
+                    if len(past_key_value) > 0:
+                        print(f"      First element type: {type(past_key_value[0])}")
+                else:
+                    print(f"  ❌ Cache is unexpected type: {type(past_key_value)}")
+            else:
+                print(f"  ❌ Cache is None (will create fresh cache)")
+        
         # 1. QKV Projection (Standard Unsloth path)
         # ============================================
         query_states = self.q_proj(hidden_states)
@@ -278,7 +296,9 @@ def create_spectral_forward(
             print(f"  Final attn_output: {attn_output.shape}")
             print(f"  Returning cache with {past_key_value.total_tokens} total tokens")
             print(f"  Cache state: {len(past_key_value.cold_blocks)} cold blocks, {past_key_value.hot_K.shape[2] if past_key_value.hot_K is not None else 0} hot tokens")
-            print(f"=" * 80)
+            print(f"  🔍 Returning cache type: {type(past_key_value)}")
+            print(f"  🔍 use_cache flag: {use_cache}")
+            print(f"={'='*80}\n")
         
         # Store cache reference for get_cache_stats()
         if use_cache and isinstance(past_key_value, SpectralCache):
