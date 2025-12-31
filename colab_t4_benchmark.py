@@ -110,11 +110,13 @@ def benchmark_generation():
         return None
     
     model_name = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
-    max_tokens = 500
+    max_tokens = 500  # NOTE: For debug logging, reduce to 50 tokens to keep logs readable
     prompt = "Write a detailed technical explanation of quantum entanglement (500 words):"
     
     print(f"\nModel: {model_name}")
     print(f"Max tokens: {max_tokens}")
+    print(f"⚠️  NOTE: Debug logging is ENABLED - logs will be verbose!")
+    print(f"    To reduce log volume, set max_tokens=50 in the code")
     
     # Baseline
     print("\n--- Baseline: Standard Cache ---")
@@ -166,7 +168,8 @@ def benchmark_generation():
         k_rank_keys=16,
         k_rank_values=32,
         use_spectral_attention=True,
-        verbose=False,
+        verbose=True,          # Show patch confirmation
+        debug_logging=True,    # Enable comprehensive cache logging
     )
     
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
