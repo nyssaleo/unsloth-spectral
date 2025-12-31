@@ -429,18 +429,24 @@ class SpectralCache:
         Make SpectralCache subscriptable for Unsloth compatibility.
         
         Unsloth expects: past_key_values[layer_idx][0] for K, [1] for V
+        Returns: [B, num_kv_heads, T, D] - NOT expanded with repeat_kv!
         
         Args:
             index: 0 for Keys, 1 for Values
             
         Returns:
-            torch.Tensor: Reconstructed K or V tensor
+            torch.Tensor: Reconstructed K or V tensor with original KV head count
         """
         if index == 0:
             K, _ = self.get_kv()
+            # Verify shape is correct (should have num_kv_heads, not num_heads)
+            assert K.shape[1] == self.num_heads, \
+                f"Cache K has wrong head count: {K.shape[1]} vs expected {self.num_heads}"
             return K
         elif index == 1:
             _, V = self.get_kv()
+            assert V.shape[1] == self.num_heads, \
+                f"Cache V has wrong head count: {V.shape[1]} vs expected {self.num_heads}"
             return V
         else:
             raise IndexError(f"SpectralCache subscript index out of range: {index} (expected 0 or 1)")

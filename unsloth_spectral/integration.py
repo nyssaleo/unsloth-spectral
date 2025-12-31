@@ -27,6 +27,7 @@ def create_spectral_forward(
     k_rank_values: int = 32,
     hot_buffer_size: int = 64,
     use_spectral_attention: bool = True,
+    debug_logging: bool = False,
 ):
     """
     Factory function that creates a spectral-enabled forward method.
@@ -96,6 +97,12 @@ def create_spectral_forward(
         key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         
+        if debug_logging:
+            print(f"[SpectralForward] After QKV projection:")
+            print(f"  Q shape: {query_states.shape} (num_heads={num_heads})")
+            print(f"  K shape: {key_states.shape} (num_kv_heads={num_key_value_heads})")
+            print(f"  V shape: {value_states.shape} (num_kv_heads={num_key_value_heads})")
+        
         # 2. RoPE (Rotary Positional Embeddings) - Unsloth's method
         # ===========================================================
         # Calculate total sequence length (current + past cache)
@@ -105,6 +112,9 @@ def create_spectral_forward(
                 kv_seq_len += past_key_value.total_tokens
             elif isinstance(past_key_value, (tuple, list)) and len(past_key_value) == 2:
                 kv_seq_len += past_key_value[0].shape[-2]
+        
+        if debug_logging:
+            print(f"[SpectralForward] RoPE: kv_seq_len={kv_seq_len}")
         
         # Extend RoPE embedding cache if needed
         if hasattr(self, 'rotary_emb') and hasattr(self.rotary_emb, 'extend_rope_embedding'):
@@ -124,19 +134,20 @@ def create_spectral_forward(
             cos, sin = self.rotary_emb(value_states, position_ids)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
-        # If we're using GQA (Grouped Query Attention), repeat K/V heads
-        if num_key_value_groups > 1:
-            key_states = repeat_kv(key_states, num_key_value_groups)
-            value_states = repeat_kv(value_states, num_key_value_groups)
+        if debug_logging:
+            print(f"[SpectralForward] After RoPE:")
+            print(f"  Q shape: {query_states.shape}")
+            print(f"  K shape: {key_states.shape}")
         
-        # 3. Spectral Cache Management
-        # ===============================
+        # 3. Spectral Cache Management - CRITICAL: Store BEFORE GQA expansion!
+        # =====================================================================
         
         # Check if past_key_value is already a SpectralCache
         if not isinstance(past_key_value, SpectralCache):
             # First call or tuple-based cache - create SpectralCache
+            # CRITICAL: Use num_key_value_heads, NOT num_heads!
             cache = SpectralCache(
-                num_heads=num_heads,
+                num_heads=num_key_value_heads,  # FIXED: Was num_heads (32), should be num_kv_heads (8)
                 head_dim=head_dim,
                 block_size=block_size,
                 k_rank_keys=k_rank_keys,
@@ -150,15 +161,45 @@ def create_spectral_forward(
             if past_key_value is not None and isinstance(past_key_value, (tuple, list)):
                 if len(past_key_value) == 2:
                     past_K, past_V = past_key_value
+                    if debug_logging:
+                        print(f"[SpectralForward] Initializing cache with past K/V:")
+                        print(f"  Past K shape: {past_K.shape}")
+                        print(f"  Past V shape: {past_V.shape}")
                     cache.append(past_K, past_V)
             
             past_key_value = cache
         
-        # Append new K, V to cache
+        # CRITICAL BUG FIX: Append to cache BEFORE repeat_kv expansion!
+        # Unsloth expects cache to store [B, num_kv_heads, T, D], not [B, num_heads, T, D]
+        if debug_logging:
+            print(f"[SpectralForward] Appending to cache (BEFORE repeat_kv):")
+            print(f"  K shape: {key_states.shape} (num_kv_heads={num_key_value_heads})")
+            print(f"  V shape: {value_states.shape}")
+        
         past_key_value.append(key_states, value_states)
         
-        # 4. Attention Computation
+        # 4. GQA Expansion - AFTER cache storage!
+        # ========================================
+        # If we're using GQA (Grouped Query Attention), repeat K/V heads for attention
+        if num_key_value_groups > 1:
+            if debug_logging:
+                print(f"[SpectralForward] Applying repeat_kv (groups={num_key_value_groups})")
+            key_states = repeat_kv(key_states, num_key_value_groups)
+            value_states = repeat_kv(value_states, num_key_value_groups)
+            if debug_logging:
+                print(f"[SpectralForward] After repeat_kv:")
+                print(f"  K shape: {key_states.shape} (expanded to {num_heads} heads)")
+                print(f"  V shape: {value_states.shape}")
+        
+        # 5. Attention Computation
         # ==========================
+        
+        if debug_logging:
+            print(f"[SpectralForward] Before attention:")
+            print(f"  Q shape: {query_states.shape}")
+            print(f"  K shape (for attention): {key_states.shape}")
+            print(f"  V shape (for attention): {value_states.shape}")
+            print(f"  Cache total tokens: {past_key_value.total_tokens}")
         
         if use_spectral_attention and past_key_value.total_tokens > block_size:
             # Use spectral attention (no reconstruction)
@@ -270,6 +311,7 @@ def patch_unsloth_attention(
     hot_buffer_size: int = 64,
     use_spectral_attention: bool = True,
     verbose: bool = True,
+    debug_logging: bool = False,
 ):
     """
     Monkey-patch all attention layers in an Unsloth model to use SpectralCache.
@@ -306,6 +348,7 @@ def patch_unsloth_attention(
                 k_rank_values=k_rank_values,
                 hot_buffer_size=hot_buffer_size,
                 use_spectral_attention=use_spectral_attention,
+                debug_logging=debug_logging,
             )
             
             # Monkey-patch (bind to instance)
