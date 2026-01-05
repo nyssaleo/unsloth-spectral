@@ -34,6 +34,7 @@ class SpectralBlock:
         scales_K: Dequantization scales for coeffs_K [H, 2] (min, max)
         scales_V: Dequantization scales for coeffs_V [H, 2]
         block_size: Number of tokens in this block
+        start_position: Absolute position of first token in this block (for RoPE)
     """
     coeffs_K: torch.Tensor
     basis_K: torch.Tensor
@@ -42,6 +43,7 @@ class SpectralBlock:
     scales_K: torch.Tensor
     scales_V: torch.Tensor
     block_size: int
+    start_position: int  # NEW: Track position for RoPE relative rotation
 
 
 class SpectralCache:
@@ -94,6 +96,10 @@ class SpectralCache:
         self.hot_V: Optional[torch.Tensor] = None
         self.cold_blocks: List[SpectralBlock] = []
         
+        # Position tracking (for RoPE relative rotation)
+        self.current_position = 0  # Absolute position in sequence
+        self.hot_position_ids: Optional[torch.Tensor] = None  # Position IDs for hot cache
+        
         # State tracking
         self.total_tokens = 0
         self.compression_count = 0
@@ -106,15 +112,16 @@ class SpectralCache:
             print(f"  k_rank_keys={k_rank_keys}, k_rank_values={k_rank_values}")
             print(f"  hot_buffer_size={hot_buffer_size}")
     
-    def append(self, K_new: torch.Tensor, V_new: torch.Tensor):
+    def append(self, K_new: torch.Tensor, V_new: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         """
         Append new Key-Value pairs to the cache.
         
         Automatically triggers compression when hot cache exceeds block_size.
         
         Args:
-            K_new: New keys [B, H, T_new, D]
+            K_new: New keys [B, H, T_new, D] (PRE-RoPE!)
             V_new: New values [B, H, T_new, D]
+            position_ids: Position IDs for the new tokens [B, T_new] (optional, auto-increments if None)
         """
         if self.debug_logging:
             print(f"\n[SpectralCache.append] Incoming K/V:")
@@ -122,10 +129,22 @@ class SpectralCache:
             print(f"  V_new shape: {V_new.shape}")
             print(f"  Before append: total_tokens={self.total_tokens}, hot_tokens={self.hot_K.shape[2] if self.hot_K is not None else 0}")
         
+        # Handle position IDs: auto-increment if not provided
+        T_new = K_new.shape[2]
+        if position_ids is None:
+            # Auto-increment positions
+            position_ids = torch.arange(
+                self.current_position, 
+                self.current_position + T_new, 
+                device=K_new.device, 
+                dtype=torch.long
+            ).unsqueeze(0)  # [1, T_new]
+        
         # First append: Initialize hot cache
         if self.hot_K is None:
             self.hot_K = K_new
             self.hot_V = V_new
+            self.hot_position_ids = position_ids
             if self.debug_logging:
                 print(f"  Action: Initialized hot cache")
         else:
@@ -133,10 +152,12 @@ class SpectralCache:
             old_hot_size = self.hot_K.shape[2]
             self.hot_K = torch.cat([self.hot_K, K_new], dim=2)
             self.hot_V = torch.cat([self.hot_V, V_new], dim=2)
+            self.hot_position_ids = torch.cat([self.hot_position_ids, position_ids], dim=1)
             if self.debug_logging:
                 print(f"  Action: Concatenated ({old_hot_size} + {K_new.shape[2]} = {self.hot_K.shape[2]} hot tokens)")
         
-        self.total_tokens += K_new.shape[2]
+        self.total_tokens += T_new
+        self.current_position += T_new
         
         if self.debug_logging:
             print(f"  After append: total_tokens={self.total_tokens}, hot_tokens={self.hot_K.shape[2]}, cold_blocks={len(self.cold_blocks)}")
@@ -166,6 +187,13 @@ class SpectralCache:
         K_block = self.hot_K[:, :, :self.block_size, :]  # [B, H, T, D]
         V_block = self.hot_V[:, :, :self.block_size, :]
         
+        # Get start position for this block
+        if self.hot_position_ids is not None:
+            start_position = self.hot_position_ids[0, 0].item()
+        else:
+            # Fallback: calculate from existing blocks
+            start_position = sum(block.block_size for block in self.cold_blocks)
+        
         # Compress K and V separately (asymmetric ranks)
         coeffs_K, basis_K, scales_K = self._compress_tensor(K_block, self.k_rank_keys)
         coeffs_V, basis_V, scales_V = self._compress_tensor(V_block, self.k_rank_values)
@@ -179,6 +207,7 @@ class SpectralCache:
             scales_K=scales_K,
             scales_V=scales_V,
             block_size=self.block_size,
+            start_position=start_position,  # NEW: Track position for RoPE
         )
         self.cold_blocks.append(block)
         self.compression_count += 1
@@ -187,9 +216,12 @@ class SpectralCache:
         if self.hot_K.shape[2] > self.block_size:
             self.hot_K = self.hot_K[:, :, self.block_size:, :].contiguous()
             self.hot_V = self.hot_V[:, :, self.block_size:, :].contiguous()
+            if self.hot_position_ids is not None:
+                self.hot_position_ids = self.hot_position_ids[:, self.block_size:].contiguous()
         else:
             self.hot_K = None
             self.hot_V = None
+            self.hot_position_ids = None
     
     def _compress_tensor(
         self, 
@@ -363,6 +395,34 @@ class SpectralCache:
             hot_V: Hot cache values [B, H, T_hot, D] or None
         """
         return self.cold_blocks, self.hot_K, self.hot_V
+    
+    def get_all_positions(self) -> torch.Tensor:
+        """
+        Get position IDs for all tokens in cache (cold + hot).
+        
+        Returns:
+            position_ids: [total_tokens] tensor of position indices
+        """
+        positions = []
+        
+        # Collect positions from cold blocks
+        for block in self.cold_blocks:
+            block_positions = torch.arange(
+                block.start_position,
+                block.start_position + block.block_size,
+                device=self.device,
+                dtype=torch.long
+            )
+            positions.append(block_positions)
+        
+        # Add hot cache positions
+        if self.hot_position_ids is not None:
+            positions.append(self.hot_position_ids.flatten())
+        
+        if len(positions) == 0:
+            return torch.empty(0, device=self.device, dtype=torch.long)
+        
+        return torch.cat(positions, dim=0)
     
     def get_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """

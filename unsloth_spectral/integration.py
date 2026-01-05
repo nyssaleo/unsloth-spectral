@@ -121,6 +121,17 @@ def create_spectral_forward(
             print(f"  K shape: {key_states.shape} (num_kv_heads={num_key_value_heads})")
             print(f"  V shape: {value_states.shape} (num_kv_heads={num_key_value_heads})")
         
+        # CRITICAL: Clone keys BEFORE RoPE for spectral cache
+        # ====================================================
+        # The spectral cache must store PRE-RoPE keys to enable
+        # the "Latent-Space Relative Rotation" trick.
+        # RoPE application mutates key_states in-place, so we clone first.
+        key_states_pre_rope = key_states.clone()
+        
+        if debug_logging:
+            print(f"[SpectralForward] Cloned pre-RoPE keys for cache:")
+            print(f"  key_states_pre_rope shape: {key_states_pre_rope.shape}")
+        
         # 2. RoPE (Rotary Positional Embeddings) - Unsloth's method
         # ===========================================================
         # Calculate total sequence length (current + past cache)
@@ -188,14 +199,19 @@ def create_spectral_forward(
             
             past_key_value = cache
         
-        # CRITICAL BUG FIX: Append to cache BEFORE repeat_kv expansion!
+        # CRITICAL: Append PRE-RoPE keys to cache!
+        # =========================================
+        # We store pre-RoPE keys so that spectral attention can apply
+        # relative rotations dynamically during score computation.
         # Unsloth expects cache to store [B, num_kv_heads, T, D], not [B, num_heads, T, D]
         if debug_logging:
-            print(f"[SpectralForward] Appending to cache (BEFORE repeat_kv):")
-            print(f"  K shape: {key_states.shape} (num_kv_heads={num_key_value_heads})")
+            print(f"[SpectralForward] Appending to cache (PRE-RoPE keys, BEFORE repeat_kv):")
+            print(f"  K_pre_rope shape: {key_states_pre_rope.shape} (num_kv_heads={num_key_value_heads})")
             print(f"  V shape: {value_states.shape}")
+            if position_ids is not None:
+                print(f"  position_ids shape: {position_ids.shape}")
         
-        past_key_value.append(key_states, value_states)
+        past_key_value.append(key_states_pre_rope, value_states, position_ids)
         
         # 4. Attention Computation
         # ==========================
@@ -216,9 +232,21 @@ def create_spectral_forward(
             # Note: spectral_attention currently only supports single-token decode
             # For prefill (q_len > 1), we fall back to standard attention
             if q_len == 1:
+                # Calculate query position for RoPE
+                # The query is at the current sequence position (after all cached tokens)
+                query_position = kv_seq_len - 1  # Last position in sequence
+                
+                if debug_logging:
+                    print(f"[SpectralForward] Calling spectral_attention_forward:")
+                    print(f"  query_position: {query_position}")
+                    print(f"  kv_seq_len: {kv_seq_len}")
+                
                 attn_output = spectral_attention_forward(
                     Q=query_states,
                     cache=past_key_value,
+                    cos=cos,
+                    sin=sin,
+                    query_position=query_position,
                     attention_mask=attention_mask,
                     scale=1.0 / math.sqrt(head_dim),
                 )
