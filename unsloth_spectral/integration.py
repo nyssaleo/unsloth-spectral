@@ -516,11 +516,15 @@ def create_spectral_forward_inference(
         key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         
+        # CRITICAL: Clone keys BEFORE RoPE for spectral cache
+        key_states_pre_rope = key_states.clone()
+        
         if debug_logging:
             print(f"  After QKV projection:")
             print(f"    Q: {query_states.shape}")
             print(f"    K: {key_states.shape}")
             print(f"    V: {value_states.shape}")
+            print(f"    K_pre_rope: {key_states_pre_rope.shape} (cloned before RoPE)")
         
         # Initialize or get cache
         if not isinstance(past_key_value, SpectralCache):
@@ -568,33 +572,67 @@ def create_spectral_forward_inference(
             cos, sin = self.rotary_emb(value_states, position_ids)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
-        # Append new K/V to cache (BEFORE GQA expansion!)
+        # Append PRE-RoPE keys to cache (BEFORE GQA expansion!)
         if debug_logging:
-            print(f"  Appending to cache: K {key_states.shape}, V {value_states.shape}")
+            print(f"  Appending to cache: K_pre_rope {key_states_pre_rope.shape}, V {value_states.shape}")
+            print(f"  position_ids: {position_ids.flatten()[:10].tolist() if position_ids is not None else 'None'}...")
         
-        past_key_value.append(key_states, value_states)
+        past_key_value.append(key_states_pre_rope, value_states, position_ids)
         
         # Now perform attention
         if use_spectral_attention and past_key_value.total_tokens > block_size:
             # Use spectral attention (direct projection)
+            query_position = kv_seq_len - 1
+            
             if debug_logging:
                 print(f"  Using spectral attention (total_tokens={past_key_value.total_tokens})")
+                print(f"  query_position: {query_position}")
             
             attn_output = spectral_attention_forward(
                 Q=query_states,
                 cache=past_key_value,
+                cos=cos,
+                sin=sin,
+                query_position=query_position,
                 attention_mask=attention_mask,
                 scale=1.0 / math.sqrt(head_dim),
-                debug_logging=debug_logging,
             )
         else:
             # Standard attention with reconstructed K/V
             if debug_logging:
                 print(f"  Using standard attention (total_tokens={past_key_value.total_tokens})")
+                print(f"  Reason: total_tokens ({past_key_value.total_tokens}) <= block_size ({block_size})")
             
             K_full, V_full = past_key_value.get_kv()
             
-            # GQA expansion (after cache retrieval)
+            if debug_logging:
+                print(f"  Retrieved from cache:")
+                print(f"    K_full: {K_full.shape if K_full is not None else 'None'} (PRE-RoPE)")
+                print(f"    V_full: {V_full.shape if V_full is not None else 'None'}")
+            
+            # CRITICAL FIX: Apply RoPE to retrieved PRE-RoPE keys
+            # Cache stores PRE-RoPE keys, but Query is POST-RoPE
+            all_positions = past_key_value.get_all_positions()
+            
+            if debug_logging:
+                print(f"  Applying RoPE to retrieved keys:")
+                print(f"    Positions: {all_positions.shape} = [{all_positions[0].item() if len(all_positions) > 0 else 'empty'}...{all_positions[-1].item() if len(all_positions) > 0 else 'empty'}]")
+            
+            # Index RoPE table with key positions
+            cos_for_keys = cos[all_positions]  # [T, D]
+            sin_for_keys = sin[all_positions]  # [T, D]
+            
+            # Reshape for broadcasting with [B, H, T, D]
+            cos_for_keys = cos_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+            sin_for_keys = sin_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+            
+            # Apply RoPE
+            K_full = apply_rope(K_full, cos_for_keys, sin_for_keys)
+            
+            if debug_logging:
+                print(f"    K_full after RoPE: {K_full.shape} (POST-RoPE, matches Q)")
+            
+            # GQA expansion (after cache retrieval and RoPE)
             if num_key_value_groups > 1:
                 if debug_logging:
                     print(f"  Expanding for GQA: {K_full.shape} → groups={num_key_value_groups}")
