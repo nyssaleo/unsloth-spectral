@@ -184,14 +184,20 @@ def spectral_attention_forward(
         
         # Step 1: Compute relative positions for this block
         # Key positions: [start_pos, start_pos+1, ..., start_pos+T_block-1]
-        # Relative to query: key_pos - query_position
+        # Distance from query to key: query_position - key_pos (MUST BE POSITIVE!)
         key_positions = torch.arange(start_pos, start_pos + T_block, device=Q.device, dtype=torch.long)
-        relative_positions = key_positions - query_position  # [T_block]
         
-        # Step 2: Extract RoPE cos/sin for relative positions
+        # CRITICAL FIX: Use positive distances to avoid negative indexing bug
+        # Previous bug: relative_positions = key_positions - query_position (negative!)
+        # PyTorch interprets cos[-1200] as cos[8192-1200] = cos[6992] ❌
+        # Correct: distances = query_position - key_positions (positive!)
+        distances = (query_position - key_positions).clamp(min=0).long()  # [T_block]
+        
+        # Step 2: Extract RoPE cos/sin for the DISTANCE
         # cos, sin are [MaxLen, D], we need [T_block, D]
-        cos_relative = cos[relative_positions]  # [T_block, D]
-        sin_relative = sin[relative_positions]  # [T_block, D]
+        # RoPE property: R(θ_m - θ_n) requires rotation by distance d = m - n
+        cos_relative = cos[distances]  # [T_block, D]
+        sin_relative = sin[distances]  # [T_block, D]
         
         # Step 3: Apply INVERSE RoPE to Q for each key position
         # Q is [B, H, 1, D] - already rotated by query_position
