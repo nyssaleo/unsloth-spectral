@@ -103,31 +103,65 @@ class SpectralCache:
         # State tracking
         self.total_tokens = 0
         self.compression_count = 0
+        self.cache_id = id(self)  # Unique cache identifier for debugging
         
         if self.debug_logging:
-            print(f"[SpectralCache.__init__] Created cache:")
+            print(f"[SpectralCache.__init__] Created NEW cache (ID: {self.cache_id}):")
             print(f"  num_heads={num_heads} (KV heads)")
             print(f"  head_dim={head_dim}")
             print(f"  block_size={block_size}")
             print(f"  k_rank_keys={k_rank_keys}, k_rank_values={k_rank_values}")
             print(f"  hot_buffer_size={hot_buffer_size}")
     
+    def reset(self):
+        """
+        Reset cache for a new generation.
+        
+        This should be called when starting a completely new generation sequence
+        to prevent contamination from previous generations.
+        """
+        if self.debug_logging:
+            print(f"\n[SpectralCache.reset] Resetting cache (ID: {self.cache_id})")
+            print(f"  Clearing {self.total_tokens} tokens, {len(self.cold_blocks)} blocks")
+        
+        self.hot_K = None
+        self.hot_V = None
+        self.hot_position_ids = None
+        self.cold_blocks = []
+        self.current_position = 0
+        self.total_tokens = 0
+        self.compression_count = 0
+    
     def append(self, K_new: torch.Tensor, V_new: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
         """
         Append new Key-Value pairs to the cache.
         
         Automatically triggers compression when hot cache exceeds block_size.
+        Detects new generation when position_ids restart from 0.
         
         Args:
             K_new: New keys [B, H, T_new, D] (PRE-RoPE!)
             V_new: New values [B, H, T_new, D]
             position_ids: Position IDs for the new tokens [B, T_new] (optional, auto-increments if None)
         """
+        # CRITICAL: Detect new generation (position_ids restart from 0)
+        if position_ids is not None and self.total_tokens > 0:
+            first_pos = position_ids[0, 0].item()
+            if first_pos < self.current_position:
+                # Position went backwards = NEW GENERATION!
+                if self.debug_logging:
+                    print(f"\n[SpectralCache.append] NEW GENERATION DETECTED!")
+                    print(f"  Previous position: {self.current_position}, New position: {first_pos}")
+                    print(f"  Resetting cache to avoid contamination")
+                self.reset()
+        
         if self.debug_logging:
-            print(f"\n[SpectralCache.append] Incoming K/V:")
+            print(f"\n[SpectralCache.append] Cache ID: {self.cache_id}")
             print(f"  K_new shape: {K_new.shape}")
             print(f"  V_new shape: {V_new.shape}")
-            print(f"  Before append: total_tokens={self.total_tokens}, hot_tokens={self.hot_K.shape[2] if self.hot_K is not None else 0}")
+            print(f"  Before append: total_tokens={self.total_tokens}, current_position={self.current_position}")
+            if position_ids is not None:
+                print(f"  position_ids: {position_ids.flatten()[:10].tolist()}...")
         
         # Handle position IDs: auto-increment if not provided
         T_new = K_new.shape[2]
