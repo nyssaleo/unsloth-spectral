@@ -357,7 +357,74 @@ cos_relative = cos[distances]  # Correct indexing ✅
 - `cos[d]` and `sin[d]` give the correct rotation for distance `d`
 - Inverse RoPE uses (cos, -sin) to align query with pre-RoPE keys
 
-**Status:** ✅ Fixed in commit (Jan 5, 2026)
+**Status:** ✅ Fixed in commit `04a0140` (Jan 5, 2026)
+
+---
+
+## 🔧 CRITICAL UPDATE #2: Fallback Path RoPE Mismatch (Jan 5, 2026)
+
+### **Root Cause #3: PRE/POST-RoPE Mismatch in Fallback Paths**
+
+After fixing the spectral path RoPE indexing, Phase 2 test **STILL** showed gibberish outputs. Further analysis revealed a **second RoPE bug** in the fallback paths.
+
+**The Bug:**
+```python
+// integration.py (Line 225)
+past_key_value.append(key_states_pre_rope, value_states, position_ids)  // Store PRE-RoPE
+
+// Line 157 (earlier)
+query_states, key_states = fast_rope_embedding(...)  // Q is POST-RoPE
+
+// Line 300 (Fallback path for short prompts)
+K_full, V_full = past_key_value.get_kv()  // K_full is PRE-RoPE
+
+// Line 319
+attn_weights = torch.matmul(query_states, K_full.transpose(2, 3))  // ❌ Q POST, K PRE!
+```
+
+**Why Short Prompts Hit This:**
+- Quality test prompts: ~20 tokens + 60 generated = ~80 total
+- Condition for spectral: `total_tokens > block_size (512)` → FALSE
+- Falls to fallback path (line 295) which had the bug
+- Previous fix (commit `04a0140`) only fixed spectral path, not fallback!
+
+**Example:**
+- Query at position 50: rotated by R(θ₅₀) ✅
+- Key at position 10: **NOT rotated** (PRE-RoPE from cache) ❌
+- Dot product: R(θ₅₀)@q · k^T → **Missing R(θ₁₀)** → Wrong attention
+
+**Impact:** ALL short prompts (< 512 tokens) produced gibberish because they never used the (fixed) spectral path.
+
+**The Fix:**
+```python
+// integration.py (After line 300)
+K_full, V_full = past_key_value.get_kv()  // Get PRE-RoPE keys
+
+// NEW: Apply RoPE to retrieved keys
+all_positions = past_key_value.get_all_positions()  // [0, 1, 2, ..., T-1]
+cos_for_keys = cos[all_positions]  // [T, D]
+sin_for_keys = sin[all_positions]  // [T, D]
+
+// Reshape for broadcast
+cos_for_keys = cos_for_keys.unsqueeze(0).unsqueeze(0)  // [1, 1, T, D]
+sin_for_keys = sin_for_keys.unsqueeze(0).unsqueeze(0)  // [1, 1, T, D]
+
+// Apply RoPE
+K_full = apply_rope(K_full, cos_for_keys, sin_for_keys)  // Now POST-RoPE ✅
+```
+
+**Why This Works:**
+- `all_positions` tracks each token's absolute position
+- `apply_rope(K_full, ...)` rotates each key by its position: K[i] → R(θ_position[i]) @ K[i]
+- Now Q (POST-RoPE) @ K (POST-RoPE) → Correct attention
+
+**Mathematical Verification:**
+- Before: Q @ K.T = R(θ_q) @ q @ k.T ❌ (missing rotation on K)
+- After:  Q @ K.T = R(θ_q) @ q @ k.T @ R(θ_k).T = R(θ_q - θ_k) @ (q @ k.T) ✅
+
+**Status:** ✅ Fixed in commit `5752fc1` (Jan 5, 2026)
+
+**Impact:** Should fix gibberish for ALL prompts (short + long)
 
 ---
 
