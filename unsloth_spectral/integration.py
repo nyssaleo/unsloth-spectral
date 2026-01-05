@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from .spectral_cache import SpectralCache
-from .spectral_attention import spectral_attention_forward
+from .spectral_attention import spectral_attention_forward, apply_rope
 import math
 
 
@@ -175,6 +175,11 @@ def create_spectral_forward(
         if not isinstance(past_key_value, SpectralCache):
             # First call or tuple-based cache - create SpectralCache
             # CRITICAL: Use num_key_value_heads, NOT num_heads!
+            if debug_logging:
+                print(f"\n[SpectralForward] Creating NEW SpectralCache")
+                print(f"  past_key_value type: {type(past_key_value)}")
+                print(f"  q_len: {q_len}")
+            
             cache = SpectralCache(
                 num_heads=num_key_value_heads,  # FIXED: Was num_heads (32), should be num_kv_heads (8)
                 head_dim=head_dim,
@@ -198,6 +203,12 @@ def create_spectral_forward(
                     cache.append(past_K, past_V)
             
             past_key_value = cache
+        else:
+            # Reusing existing SpectralCache from previous step
+            if debug_logging:
+                print(f"\n[SpectralForward] REUSING existing SpectralCache (ID: {past_key_value.cache_id})")
+                print(f"  Cache state: {past_key_value.total_tokens} tokens, position={past_key_value.current_position}")
+                print(f"  q_len: {q_len}")
         
         # CRITICAL: Append PRE-RoPE keys to cache!
         # =========================================
@@ -259,8 +270,32 @@ def create_spectral_forward(
                 
                 if debug_logging:
                     print(f"[SpectralForward] Retrieved from cache:")
-                    print(f"  K_full: {K_full.shape if K_full is not None else 'None'}")
+                    print(f"  K_full: {K_full.shape if K_full is not None else 'None'} (PRE-RoPE)")
                     print(f"  V_full: {V_full.shape if V_full is not None else 'None'}")
+                
+                # CRITICAL FIX: Apply RoPE to retrieved PRE-RoPE keys
+                # =========================================================
+                # Cache stores PRE-RoPE keys, but Query is POST-RoPE.
+                # We must rotate keys by their absolute positions before attention.
+                all_positions = past_key_value.get_all_positions()
+                
+                if debug_logging:
+                    print(f"[SpectralForward] Applying RoPE to retrieved keys:")
+                    print(f"  Positions: {all_positions.shape} = [{all_positions[0].item()}...{all_positions[-1].item()}]")
+                
+                # Index RoPE table with key positions
+                cos_for_keys = cos[all_positions]  # [T, D]
+                sin_for_keys = sin[all_positions]  # [T, D]
+                
+                # Reshape for broadcasting with [B, H, T, D]
+                cos_for_keys = cos_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+                sin_for_keys = sin_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+                
+                # Apply RoPE to keys
+                K_full = apply_rope(K_full, cos_for_keys, sin_for_keys)
+                
+                if debug_logging:
+                    print(f"  K_full after RoPE: {K_full.shape} (POST-RoPE, matches Q)")
                 
                 # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
                 if num_key_value_groups > 1:
@@ -285,13 +320,38 @@ def create_spectral_forward(
             # Standard attention (for short contexts or validation)
             if debug_logging:
                 print(f"\n[SpectralForward] Standard attention path - retrieving full context from cache")
+                print(f"  Reason: total_tokens ({past_key_value.total_tokens}) <= block_size ({block_size})")
             
             K_full, V_full = past_key_value.get_kv()
             
             if debug_logging:
                 print(f"[SpectralForward] Retrieved from cache:")
-                print(f"  K_full: {K_full.shape if K_full is not None else 'None'}")
+                print(f"  K_full: {K_full.shape if K_full is not None else 'None'} (PRE-RoPE)")
                 print(f"  V_full: {V_full.shape if V_full is not None else 'None'}")
+            
+            # CRITICAL FIX: Apply RoPE to retrieved PRE-RoPE keys
+            # =========================================================
+            # Cache stores PRE-RoPE keys, but Query is POST-RoPE.
+            # We must rotate keys by their absolute positions before attention.
+            all_positions = past_key_value.get_all_positions()
+            
+            if debug_logging:
+                print(f"[SpectralForward] Applying RoPE to retrieved keys:")
+                print(f"  Positions: {all_positions.shape} = [{all_positions[0].item() if len(all_positions) > 0 else 'empty'}...{all_positions[-1].item() if len(all_positions) > 0 else 'empty'}]")
+            
+            # Index RoPE table with key positions
+            cos_for_keys = cos[all_positions]  # [T, D]
+            sin_for_keys = sin[all_positions]  # [T, D]
+            
+            # Reshape for broadcasting with [B, H, T, D]
+            cos_for_keys = cos_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+            sin_for_keys = sin_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
+            
+            # Apply RoPE to keys
+            K_full = apply_rope(K_full, cos_for_keys, sin_for_keys)
+            
+            if debug_logging:
+                print(f"  K_full after RoPE: {K_full.shape} (POST-RoPE, matches Q)")
             
             # CRITICAL FIX: Expand K/V to match Q heads AFTER getting full context
             if num_key_value_groups > 1:
