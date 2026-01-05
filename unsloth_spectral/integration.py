@@ -516,15 +516,11 @@ def create_spectral_forward_inference(
         key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         
-        # CRITICAL: Clone keys BEFORE RoPE for spectral cache
-        key_states_pre_rope = key_states.clone()
-        
         if debug_logging:
             print(f"  After QKV projection:")
             print(f"    Q: {query_states.shape}")
             print(f"    K: {key_states.shape}")
             print(f"    V: {value_states.shape}")
-            print(f"    K_pre_rope: {key_states_pre_rope.shape} (cloned before RoPE)")
         
         # Initialize or get cache
         if not isinstance(past_key_value, SpectralCache):
@@ -543,12 +539,8 @@ def create_spectral_forward_inference(
                 debug_logging=debug_logging,
             )
             
-            # If we received a tuple cache, initialize from it
-            if isinstance(past_key_value, (tuple, list)) and len(past_key_value) == 2:
-                past_K, past_V = past_key_value
-                if debug_logging:
-                    print(f"  Initializing from tuple: K {past_K.shape}, V {past_V.shape}")
-                cache.append(past_K, past_V)
+            # CONTAMINATION GUARD: Do NOT import tuple cache
+            # Start fresh to avoid contamination from previous runs
             
             past_key_value = cache
         
@@ -573,6 +565,10 @@ def create_spectral_forward_inference(
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
         # Append PRE-RoPE keys to cache (BEFORE GQA expansion!)
+        # NOTE: Unsloth's fast_rope_embedding may modify tensors in-place
+        # To be safe, re-project K to get guaranteed PRE-RoPE version (cheap for q_len=1)
+        key_states_pre_rope = self.k_proj(hidden_states).view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        
         if debug_logging:
             print(f"  Appending to cache: K_pre_rope {key_states_pre_rope.shape}, V {value_states.shape}")
             print(f"  position_ids: {position_ids.flatten()[:10].tolist() if position_ids is not None else 'None'}...")
@@ -618,15 +614,16 @@ def create_spectral_forward_inference(
                 print(f"  Applying RoPE to retrieved keys:")
                 print(f"    Positions: {all_positions.shape} = [{all_positions[0].item() if len(all_positions) > 0 else 'empty'}...{all_positions[-1].item() if len(all_positions) > 0 else 'empty'}]")
             
-            # Index RoPE table with key positions
-            cos_for_keys = cos[all_positions]  # [T, D]
-            sin_for_keys = sin[all_positions]  # [T, D]
+            # Handle Unsloth vs Standard RoPE Cache
+            if hasattr(self.rotary_emb, 'get_cached'):
+                # Unsloth style: cos/sin are [MaxLen, D], slice by position indices
+                cos_for_keys = cos[all_positions].unsqueeze(0).unsqueeze(0)
+                sin_for_keys = sin[all_positions].unsqueeze(0).unsqueeze(0)
+            else:
+                # Standard style: compute cos/sin for specific positions
+                cos_for_keys, sin_for_keys = self.rotary_emb(V_full, all_positions.unsqueeze(0))
             
-            # Reshape for broadcasting with [B, H, T, D]
-            cos_for_keys = cos_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
-            sin_for_keys = sin_for_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T, D]
-            
-            # Apply RoPE
+            # Apply RoPE to the raw keys from cache
             K_full = apply_rope(K_full, cos_for_keys, sin_for_keys)
             
             if debug_logging:
