@@ -1442,10 +1442,12 @@ def test_memory_breakdown():
     print("\n" + "=" * 70)
     print("MEMORY BREAKDOWN")
     print("=" * 70)
-    
-    model_memory = memory_log[1][0] - memory_log[0][0]
-    generation_overhead = memory_log[4][0] - memory_log[3][0]
-    peak_overhead = peak_mb - memory_log[3][0]
+
+    # memory_log entries are (label, allocated_mb, reserved_mb)
+    # Index [1] is allocated_mb, [0] is the label string
+    model_memory = memory_log[1][1] - memory_log[0][1]
+    generation_overhead = memory_log[4][1] - memory_log[3][1]
+    peak_overhead = peak_mb - memory_log[3][1]
     
     # KV cache calculations
     theoretical_kv_bytes = calculate_theoretical_kv_size(tokens_per_layer)
