@@ -146,7 +146,11 @@ class SpectralCache:
         """
         # CRITICAL: Detect new generation (position_ids restart from 0)
         if position_ids is not None and self.total_tokens > 0:
-            first_pos = position_ids[0, 0].item()
+            # Handle both 1D and 2D position_ids (Unsloth decode can pass 1D)
+            if position_ids.dim() == 1:
+                first_pos = position_ids[0].item()
+            else:
+                first_pos = position_ids[0, 0].item()
             if first_pos < self.current_position:
                 # Position went backwards = NEW GENERATION!
                 if self.debug_logging:
@@ -173,6 +177,11 @@ class SpectralCache:
                 device=K_new.device, 
                 dtype=torch.long
             ).unsqueeze(0)  # [1, T_new]
+        else:
+            # NORMALIZE: Ensure position_ids is always 2D [B, T_new]
+            # Unsloth's decode path may pass 1D tensor [T_new]
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)  # [1, T_new]
         
         # First append: Initialize hot cache
         if self.hot_K is None:
