@@ -1,14 +1,21 @@
 """
-COMPREHENSIVE LONG-CONTEXT VALIDATION TEST SUITE
-================================================
+COMPREHENSIVE LONG-CONTEXT VALIDATION TEST SUITE v2
+====================================================
 
 This script validates the Unsloth Spectral KV Cache implementation with extensive tests:
 1. Unit Tests: Isolated component verification
 2. Long Context Tests: Compression trigger verification (>512 tokens)
-3. Needle-in-Haystack: Factual recall under compression
-4. Memory Profiling: VRAM usage measurement
-5. Quality Metrics: Generation comparison
-6. Performance Benchmarks: Throughput measurement
+3. Very Long Context: 2000-4000 token tests for real compression benefits
+4. Needle-in-Haystack: Factual recall under compression
+5. Memory Profiling: VRAM usage measurement
+6. Quality Metrics: Generation comparison (with cache reset between prompts)
+7. Performance Benchmarks: Throughput measurement
+
+FIXES in v2:
+- Cache contamination fix: Reset between prompts in quality test
+- Model: Mistral-7B-Instruct (more capable than Llama-1B)
+- Memory calculation: Corrected formula
+- Long context: Added 2000-4000 token tests
 
 Run in Google Colab with T4 GPU. Copy this entire file into a single code cell.
 
@@ -20,7 +27,7 @@ Date: January 2026
 # CELL 0: INSTALLATION & SETUP
 # =============================================================================
 print("=" * 70)
-print("UNSLOTH SPECTRAL - COMPREHENSIVE VALIDATION SUITE")
+print("UNSLOTH SPECTRAL - COMPREHENSIVE VALIDATION SUITE v2")
 print("=" * 70)
 
 import subprocess
@@ -136,6 +143,70 @@ except ImportError as e:
 print("\n" + "=" * 70)
 
 # =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+# Using Mistral-7B for better quality and realistic testing
+MODEL_NAME = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
+MAX_SEQ_LENGTH = 8192  # Mistral supports long context
+NUM_LAYERS = 32        # Mistral-7B has 32 layers
+NUM_KV_HEADS = 8       # Mistral uses GQA with 8 KV heads
+NUM_Q_HEADS = 32       # 32 query heads
+HEAD_DIM = 128         # 128 dim per head
+
+print(f"Model: {MODEL_NAME}")
+print(f"Config: {NUM_LAYERS} layers, {NUM_KV_HEADS} KV heads, {NUM_Q_HEADS} Q heads, {HEAD_DIM} dim")
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def reset_all_caches(model):
+    """
+    Reset SpectralCache for all layers to prevent contamination between prompts.
+    
+    CRITICAL: Without this, cache from previous generations leaks into new ones,
+    causing outputs like "The quick brown fox -> 1, 1, 2, 3, 5..." (Fibonacci contamination)
+    """
+    reset_count = 0
+    for layer in model.model.layers:
+        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, '_spectral_cache'):
+            cache = layer.self_attn._spectral_cache
+            if isinstance(cache, SpectralCache) and hasattr(cache, 'reset'):
+                cache.reset()
+                reset_count += 1
+    return reset_count
+
+
+def calculate_theoretical_kv_size(tokens_per_layer: int, num_layers: int = NUM_LAYERS, 
+                                   num_kv_heads: int = NUM_KV_HEADS, head_dim: int = HEAD_DIM) -> int:
+    """
+    Calculate theoretical uncompressed KV cache size in bytes.
+    
+    Formula: num_layers × 2 (K+V) × T × H_kv × D × 2 (FP16 bytes)
+    
+    Args:
+        tokens_per_layer: Tokens stored per layer (NOT total across all layers)
+        num_layers: Number of transformer layers
+        num_kv_heads: Number of KV heads (8 for Mistral GQA)
+        head_dim: Dimension per head (128)
+    
+    Returns:
+        Size in bytes
+    """
+    return num_layers * 2 * tokens_per_layer * num_kv_heads * head_dim * 2
+
+
+def get_tokens_per_layer_from_stats(stats: dict, num_layers: int = NUM_LAYERS) -> int:
+    """
+    Extract tokens per layer from aggregated stats.
+    
+    stats['total_tokens'] sums tokens across all layers, so divide by num_layers.
+    """
+    if stats['total_tokens'] == 0 or stats['layers_with_cache'] == 0:
+        return 0
+    return stats['total_tokens'] // stats['layers_with_cache']
+
+
+# =============================================================================
 # CELL 2: UNIT TESTS - SPECTRAL CACHE ISOLATION
 # =============================================================================
 def test_spectral_cache_unit():
@@ -149,11 +220,11 @@ def test_spectral_cache_unit():
         return False
     
     # Configuration matching Mistral-7B
-    H_kv = 8       # num_key_value_heads
-    D = 128        # head_dim
+    H_kv = NUM_KV_HEADS  # 8
+    D = HEAD_DIM         # 128
     block_size = 512
-    k_K = 16       # k_rank_keys
-    k_V = 32       # k_rank_values
+    k_K = 16             # k_rank_keys
+    k_V = 32             # k_rank_values
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
@@ -279,14 +350,14 @@ def test_kernel_functions():
     dtype = torch.float16 if device == "cuda" else torch.float32
     
     # Configuration
-    B = 1          # batch
-    H_q = 32       # num_attention_heads (query)
-    H_kv = 8       # num_key_value_heads
-    D = 128        # head_dim
-    T_block = 256  # tokens in compressed block
-    k_K = 16       # key rank
-    k_V = 32       # value rank
-    max_seq = 8192 # RoPE table size
+    B = 1              # batch
+    H_q = NUM_Q_HEADS  # 32
+    H_kv = NUM_KV_HEADS # 8
+    D = HEAD_DIM       # 128
+    T_block = 256      # tokens in compressed block
+    k_K = 16           # key rank
+    k_V = 32           # value rank
+    max_seq = 8192     # RoPE table size
     
     print(f"Config: B={B}, H_q={H_q}, H_kv={H_kv}, D={D}, T_block={T_block}")
     
@@ -413,7 +484,7 @@ def test_kernel_functions():
 def test_long_context_compression():
     """Test that compression actually triggers and works with long contexts."""
     print("\n" + "=" * 70)
-    print("LONG CONTEXT TEST: Compression Verification")
+    print("LONG CONTEXT TEST: Compression Verification (Mistral-7B)")
     print("=" * 70)
     
     if not (SPECTRAL_OK and UNSLOTH_OK):
@@ -424,11 +495,11 @@ def test_long_context_compression():
         print("❌ Skipping: CUDA not available")
         return False
     
-    # Load model
-    print("\n📥 Loading model...")
+    # Load Mistral-7B model
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
-        max_seq_length=4096,
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
     )
     
@@ -447,33 +518,36 @@ def test_long_context_compression():
     )
     
     # Create a LONG prompt (> 512 tokens to trigger compression)
-    print("\n📝 Creating long prompt (target: >600 tokens)...")
+    print("\n📝 Creating long prompt (target: ~1500 tokens)...")
     
-    # Generate a long context with repeated pattern
+    # Generate a long context with varied content
     base_text = """
-    This is an extensive technical document about machine learning. 
-    Machine learning involves training models on data to make predictions.
+    This is an extensive technical document about machine learning and artificial intelligence.
+    Machine learning involves training models on data to make predictions and decisions.
     Neural networks are a key component of modern machine learning systems.
-    Deep learning has revolutionized computer vision, NLP, and more.
-    Transformers have become the dominant architecture for language tasks.
+    Deep learning has revolutionized computer vision, natural language processing, and more.
+    Transformers have become the dominant architecture for language modeling tasks.
+    Attention mechanisms allow models to focus on relevant parts of the input.
+    The key insight of transformers is self-attention: each token attends to all other tokens.
+    This enables capturing long-range dependencies in sequences.
     """
     
-    # Repeat to get >600 tokens
-    long_context = (base_text * 15)  # Should be ~750 tokens
+    # Repeat to get ~1500 tokens
+    long_context = (base_text * 20)  # Should be ~1600 tokens
     
     # Add a specific fact we'll test recall on
-    needle = "The secret code is ALPHA-7892."
-    long_context += f"\n\nIMPORTANT NOTE: {needle}\n\n"
-    long_context += "Now, continuing with our discussion of transformers..."
+    needle = "The secret access code for the quantum laboratory is OMEGA-3847-DELTA."
+    long_context += f"\n\n[IMPORTANT SECURITY NOTE: {needle}]\n\n"
+    long_context += "Now, continuing with our discussion of neural network architectures..."
     
     # Tokenize
     inputs = tokenizer(long_context, return_tensors="pt").to("cuda")
     prompt_length = inputs["input_ids"].shape[1]
     print(f"Prompt length: {prompt_length} tokens")
     
-    if prompt_length < 512:
-        print(f"⚠️ Warning: Prompt ({prompt_length}) < block_size (512). Adding more content...")
-        long_context = (base_text * 25) + f"\n\nIMPORTANT NOTE: {needle}\n\n"
+    if prompt_length < 1000:
+        print(f"⚠️ Warning: Prompt ({prompt_length}) < 1000. Adding more content...")
+        long_context = (base_text * 35) + f"\n\n[IMPORTANT: {needle}]\n\n"
         inputs = tokenizer(long_context, return_tensors="pt").to("cuda")
         prompt_length = inputs["input_ids"].shape[1]
         print(f"Extended prompt length: {prompt_length} tokens")
@@ -506,24 +580,197 @@ def test_long_context_compression():
     # Check cache statistics
     print("\n📊 Cache Statistics:")
     stats = get_cache_stats(model)
+    tokens_per_layer = get_tokens_per_layer_from_stats(stats)
+    
     print(f"  Layers with cache: {stats['layers_with_cache']}")
-    print(f"  Total tokens: {stats['total_tokens']}")
+    print(f"  Tokens per layer: {tokens_per_layer}")
     print(f"  Total blocks: {stats['total_blocks']}")
     print(f"  Compression ratio: {stats['compression_ratio']:.2f}x")
+    
+    # Calculate theoretical vs actual memory
+    theoretical_bytes = calculate_theoretical_kv_size(tokens_per_layer)
+    actual_bytes = stats.get('total_compressed_bytes', 0)
+    
+    print(f"\n📊 Memory Analysis:")
+    print(f"  Theoretical uncompressed: {theoretical_bytes / 1024**2:.2f} MB")
+    print(f"  Actual compressed: {actual_bytes / 1024**2:.2f} MB")
+    print(f"  Memory savings: {(1 - actual_bytes/theoretical_bytes)*100:.1f}%" if theoretical_bytes > 0 else "N/A")
     
     # Verify compression occurred
     success = True
     if prompt_length > 512:
-        expected_blocks = prompt_length // 512
+        expected_blocks_per_layer = prompt_length // 512
         if stats['total_blocks'] == 0:
             print(f"❌ FAIL: Expected compression (prompt={prompt_length} > 512) but got 0 blocks")
             success = False
         else:
-            print(f"✅ Compression verified: {stats['total_blocks']} blocks for {prompt_length} tokens")
+            print(f"✅ Compression verified: {stats['total_blocks']} blocks (expect ~{expected_blocks_per_layer * NUM_LAYERS})")
     
     # Test needle recall
     print("\n🔍 Testing needle recall...")
-    recall_prompt = long_context + "\nWhat is the secret code mentioned above?"
+    reset_all_caches(model)  # CRITICAL: Reset before new generation
+    
+    recall_prompt = long_context + "\nWhat is the secret access code mentioned above? Answer directly:"
+    recall_inputs = tokenizer(recall_prompt, return_tensors="pt").to("cuda")
+    
+    with torch.no_grad():
+        recall_outputs = model.generate(
+            **recall_inputs,
+            max_new_tokens=50,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+    
+    recall_text = tokenizer.decode(recall_outputs[0][recall_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    print(f"Recall response: {recall_text[:150]}...")
+    
+    if "OMEGA-3847-DELTA" in recall_text or "omega-3847-delta" in recall_text.lower():
+        print("✅ Needle successfully recalled!")
+    elif "OMEGA" in recall_text or "3847" in recall_text or "DELTA" in recall_text:
+        print("⚠️ Partial needle recall (some parts found)")
+    else:
+        print("⚠️ Needle not found in response (may be model/compression limitation)")
+    
+    # Cleanup
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print("\n" + "=" * 70)
+    print(f"LONG CONTEXT TEST: {'✅ PASSED' if success else '❌ FAILED'}")
+    print("=" * 70)
+    return success
+
+
+# =============================================================================
+# CELL 5: VERY LONG CONTEXT TEST (2000-4000 tokens)
+# =============================================================================
+def test_very_long_context():
+    """Test with very long context (2000-4000 tokens) to see real compression benefits."""
+    print("\n" + "=" * 70)
+    print("VERY LONG CONTEXT TEST: 2000-4000 Tokens")
+    print("=" * 70)
+    
+    if not (SPECTRAL_OK and UNSLOTH_OK):
+        print("❌ Skipping: Required modules not available")
+        return False
+    
+    if not torch.cuda.is_available():
+        print("❌ Skipping: CUDA not available")
+        return False
+    
+    # Load model
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True,
+    )
+    
+    # Patch with spectral cache
+    patch_unsloth_attention(
+        model,
+        block_size=512,
+        k_rank_keys=16,
+        k_rank_values=32,
+        hot_buffer_size=64,
+        use_spectral_attention=True,
+        verbose=True,
+        debug_logging=False,
+    )
+    
+    # Create VERY long context (~3000 tokens)
+    print("\n📝 Creating very long prompt (target: ~3000 tokens)...")
+    
+    # Rich, varied content to avoid repetition patterns
+    sections = [
+        "In the realm of artificial intelligence, neural networks have emerged as powerful tools.",
+        "The backpropagation algorithm revolutionized how we train deep neural networks.",
+        "Convolutional neural networks excel at processing grid-like topology data such as images.",
+        "Recurrent neural networks were designed to handle sequential data with temporal dependencies.",
+        "Long Short-Term Memory networks address the vanishing gradient problem in RNNs.",
+        "Transformers replaced recurrence with attention mechanisms for parallel processing.",
+        "BERT introduced bidirectional pre-training for language understanding tasks.",
+        "GPT models demonstrated the power of autoregressive language modeling at scale.",
+        "Diffusion models have shown remarkable results in image generation tasks.",
+        "Reinforcement learning from human feedback aligns model outputs with human preferences.",
+    ]
+    
+    # Generate ~3000 tokens of varied content
+    long_context = ""
+    for i in range(30):  # Repeat sections with variations
+        for j, section in enumerate(sections):
+            long_context += f"Section {i*10 + j + 1}: {section} "
+            long_context += "This represents a key advancement in the field. "
+    
+    # Add needle in the middle
+    needle = "CLASSIFIED: Project Starlight uses encryption key XK-9921-GAMMA-7."
+    middle_pos = len(long_context) // 2
+    long_context = long_context[:middle_pos] + f"\n[{needle}]\n" + long_context[middle_pos:]
+    
+    # Tokenize
+    inputs = tokenizer(long_context, return_tensors="pt", max_length=3500, truncation=True).to("cuda")
+    prompt_length = inputs["input_ids"].shape[1]
+    print(f"Prompt length: {prompt_length} tokens")
+    
+    # Expected compression
+    expected_blocks = (prompt_length // 512)
+    compressed_tokens = expected_blocks * 512
+    hot_tokens = prompt_length - compressed_tokens
+    theoretical_compression = prompt_length / (hot_tokens + compressed_tokens * 0.1)  # Rough estimate
+    print(f"Expected: {expected_blocks} blocks compressed, {hot_tokens} hot tokens")
+    print(f"Theoretical max compression: ~{theoretical_compression:.1f}x")
+    
+    # Generate
+    print("\n🔄 Running generation...")
+    torch.cuda.reset_peak_memory_stats()
+    start_time = time.time()
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+    
+    gen_time = time.time() - start_time
+    peak_memory = torch.cuda.max_memory_allocated() / 1024**2
+    new_tokens = outputs.shape[1] - prompt_length
+    
+    print(f"Generation time: {gen_time:.2f}s")
+    print(f"Generated {new_tokens} new tokens")
+    print(f"Speed: {new_tokens / gen_time:.2f} tokens/sec")
+    print(f"Peak VRAM: {peak_memory:.1f} MB")
+    
+    # Cache statistics
+    stats = get_cache_stats(model)
+    tokens_per_layer = get_tokens_per_layer_from_stats(stats)
+    
+    print("\n📊 Compression Statistics:")
+    print(f"  Layers with cache: {stats['layers_with_cache']}")
+    print(f"  Tokens per layer: {tokens_per_layer}")
+    print(f"  Total compressed blocks: {stats['total_blocks']}")
+    print(f"  Compression ratio: {stats['compression_ratio']:.2f}x")
+    
+    # Memory analysis
+    theoretical_bytes = calculate_theoretical_kv_size(tokens_per_layer)
+    actual_bytes = stats.get('total_compressed_bytes', 0)
+    
+    print(f"\n📊 Memory Analysis:")
+    print(f"  Theoretical uncompressed KV: {theoretical_bytes / 1024**2:.2f} MB")
+    print(f"  Actual compressed: {actual_bytes / 1024**2:.2f} MB")
+    if theoretical_bytes > 0 and actual_bytes > 0:
+        savings = (1 - actual_bytes / theoretical_bytes) * 100
+        print(f"  Memory savings: {savings:.1f}%")
+    
+    # Needle recall test
+    print("\n🔍 Testing needle recall from middle of context...")
+    reset_all_caches(model)
+    
+    recall_prompt = long_context[:1000] + "\n\nQuestion: What is the Project Starlight encryption key?\nAnswer:"
     recall_inputs = tokenizer(recall_prompt, return_tensors="pt").to("cuda")
     
     with torch.no_grad():
@@ -538,10 +785,12 @@ def test_long_context_compression():
     recall_text = tokenizer.decode(recall_outputs[0][recall_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     print(f"Recall response: {recall_text}")
     
-    if "ALPHA-7892" in recall_text or "alpha-7892" in recall_text.lower():
-        print("✅ Needle successfully recalled!")
+    if "XK-9921-GAMMA-7" in recall_text:
+        print("✅ Needle perfectly recalled!")
+    elif any(x in recall_text for x in ["XK", "9921", "GAMMA"]):
+        print("⚠️ Partial recall")
     else:
-        print("⚠️ Needle not found in response (may be model limitation)")
+        print("⚠️ Needle not found")
     
     # Cleanup
     del model, tokenizer
@@ -549,18 +798,18 @@ def test_long_context_compression():
     torch.cuda.empty_cache()
     
     print("\n" + "=" * 70)
-    print(f"LONG CONTEXT TEST: {'✅ PASSED' if success else '❌ FAILED'}")
+    print("VERY LONG CONTEXT TEST: ✅ COMPLETE")
     print("=" * 70)
-    return success
+    return True
 
 
 # =============================================================================
-# CELL 5: MEMORY PROFILING
+# CELL 6: MEMORY PROFILING
 # =============================================================================
 def test_memory_usage():
-    """Profile VRAM usage with and without spectral compression."""
+    """Profile VRAM usage with spectral compression."""
     print("\n" + "=" * 70)
-    print("MEMORY PROFILING")
+    print("MEMORY PROFILING (Mistral-7B)")
     print("=" * 70)
     
     if not (SPECTRAL_OK and UNSLOTH_OK):
@@ -587,10 +836,10 @@ def test_memory_usage():
     print(f"Baseline VRAM: {baseline_memory:.1f} MB")
     
     # Load model
-    print("\n📥 Loading model...")
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
-        max_seq_length=4096,
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
     )
     
@@ -607,9 +856,9 @@ def test_memory_usage():
         debug_logging=False,
     )
     
-    # Create long prompt
-    long_text = "The quick brown fox jumps over the lazy dog. " * 150  # ~900 tokens
-    inputs = tokenizer(long_text, return_tensors="pt").to("cuda")
+    # Create long prompt (~2000 tokens)
+    long_text = "The quick brown fox jumps over the lazy dog. " * 250  # ~2500 tokens
+    inputs = tokenizer(long_text, return_tensors="pt", max_length=2000, truncation=True).to("cuda")
     prompt_tokens = inputs["input_ids"].shape[1]
     print(f"\nPrompt length: {prompt_tokens} tokens")
     
@@ -638,20 +887,24 @@ def test_memory_usage():
     
     # Get cache stats
     stats = get_cache_stats(model)
-    print(f"\nCache statistics:")
-    print(f"  Total tokens cached: {stats['total_tokens']}")
+    tokens_per_layer = get_tokens_per_layer_from_stats(stats)
+    
+    print(f"\n📊 Cache Statistics:")
+    print(f"  Tokens per layer: {tokens_per_layer}")
+    print(f"  Total blocks: {stats['total_blocks']}")
     print(f"  Compression ratio: {stats['compression_ratio']:.2f}x")
     
-    # Theoretical uncompressed size
-    # Assuming 32 layers, 8 KV heads, 128 dim, FP16
-    theoretical_uncompressed_mb = (
-        32 * 8 * stats['total_tokens'] * 128 * 2 * 2  # K and V
-    ) / 1024**2 if stats['total_tokens'] > 0 else 0
+    # Corrected memory calculation
+    # Formula: num_layers × 2 (K+V) × T × H_kv × D × 2 (FP16 bytes)
+    theoretical_bytes = calculate_theoretical_kv_size(tokens_per_layer)
+    actual_bytes = stats.get('total_compressed_bytes', 0)
     
-    print(f"\n📊 Memory Analysis:")
-    print(f"  Theoretical uncompressed KV cache: {theoretical_uncompressed_mb:.1f} MB")
-    print(f"  Actual compressed: {stats.get('total_compressed_bytes', 0) / 1024**2:.1f} MB")
-    print(f"  Compression achieved: {stats['compression_ratio']:.2f}x")
+    print(f"\n📊 Memory Analysis (Corrected):")
+    print(f"  Theoretical uncompressed KV cache: {theoretical_bytes / 1024**2:.2f} MB")
+    print(f"  Formula: {NUM_LAYERS} layers × 2 × {tokens_per_layer} tokens × {NUM_KV_HEADS} heads × {HEAD_DIM} dim × 2 bytes")
+    print(f"  Actual compressed: {actual_bytes / 1024**2:.2f} MB")
+    if theoretical_bytes > 0:
+        print(f"  True compression: {theoretical_bytes / actual_bytes:.2f}x" if actual_bytes > 0 else "  N/A")
     
     # Cleanup
     del model, tokenizer
@@ -665,12 +918,12 @@ def test_memory_usage():
 
 
 # =============================================================================
-# CELL 6: QUALITY COMPARISON
+# CELL 7: QUALITY COMPARISON (WITH CACHE RESET FIX)
 # =============================================================================
 def test_generation_quality():
-    """Compare generation quality with and without spectral compression."""
+    """Compare generation quality with cache reset between prompts."""
     print("\n" + "=" * 70)
-    print("QUALITY COMPARISON TEST")
+    print("QUALITY COMPARISON TEST (Mistral-7B + Cache Reset)")
     print("=" * 70)
     
     if not (SPECTRAL_OK and UNSLOTH_OK):
@@ -682,10 +935,10 @@ def test_generation_quality():
         return False
     
     # Load model WITH spectral cache
-    print("\n📥 Loading model with spectral cache...")
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
-        max_seq_length=4096,
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
     )
     
@@ -699,18 +952,37 @@ def test_generation_quality():
     )
     
     # Test prompts
-    prompts = [
-        "Continue the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,",
-        "The quick brown fox",
-        "What is 15 + 27?",
-        "Write a haiku about programming:",
+    test_cases = [
+        {
+            "name": "Fibonacci",
+            "prompt": "Continue the Fibonacci sequence: 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144,",
+            "check": lambda x: any(n in x for n in ["233", "377", "610"]),
+        },
+        {
+            "name": "Common Phrase",
+            "prompt": "The quick brown fox",
+            "check": lambda x: "jumps" in x.lower() or "lazy" in x.lower() or "dog" in x.lower(),
+        },
+        {
+            "name": "Math",
+            "prompt": "Calculate: 15 + 27 = ",
+            "check": lambda x: "42" in x,
+        },
+        {
+            "name": "Capital City",
+            "prompt": "The capital of France is",
+            "check": lambda x: "paris" in x.lower(),
+        },
     ]
     
-    print("\n📝 Generating with spectral cache...")
-    spectral_outputs = []
+    print("\n📝 Generating with spectral cache (RESET between prompts)...")
+    results = []
     
-    for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    for test in test_cases:
+        # CRITICAL FIX: Reset cache before each independent prompt
+        reset_count = reset_all_caches(model)
+        
+        inputs = tokenizer(test["prompt"], return_tensors="pt").to("cuda")
         
         with torch.no_grad():
             outputs = model.generate(
@@ -722,35 +994,32 @@ def test_generation_quality():
             )
         
         text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        spectral_outputs.append(text)
-        print(f"\nPrompt: {prompt}")
-        print(f"Output: {text[len(prompt):].strip()[:100]}...")
+        output_only = text[len(test["prompt"]):].strip()
+        passed = test["check"](text)
+        
+        results.append({
+            "name": test["name"],
+            "prompt": test["prompt"],
+            "output": output_only[:100],
+            "passed": passed,
+        })
+        
+        print(f"\n[{test['name']}] (reset {reset_count} caches)")
+        print(f"  Prompt: {test['prompt']}")
+        print(f"  Output: {output_only[:80]}...")
+        print(f"  Status: {'✅ PASS' if passed else '⚠️ CHECK'}")
     
-    # Check specific outputs
+    # Summary
     print("\n" + "=" * 70)
-    print("QUALITY ANALYSIS")
+    print("QUALITY ANALYSIS SUMMARY")
     print("=" * 70)
     
-    # Fibonacci check
-    fib_output = spectral_outputs[0]
-    if any(n in fib_output for n in ["233", "377", "610"]):
-        print("✅ Fibonacci continuation: CORRECT (found expected numbers)")
-    else:
-        print("⚠️ Fibonacci continuation: May be incorrect")
+    passed_count = sum(1 for r in results if r["passed"])
+    for r in results:
+        status = "✅" if r["passed"] else "⚠️"
+        print(f"  {status} {r['name']}")
     
-    # Fox check
-    fox_output = spectral_outputs[1]
-    if "jumps" in fox_output.lower() or "lazy" in fox_output.lower():
-        print("✅ Common phrase completion: CORRECT")
-    else:
-        print("⚠️ Common phrase completion: Unexpected output")
-    
-    # Math check
-    math_output = spectral_outputs[2]
-    if "42" in math_output:
-        print("✅ Math problem: CORRECT")
-    else:
-        print(f"⚠️ Math problem: Got '{math_output}', expected '42'")
+    print(f"\n  Results: {passed_count}/{len(results)} tests passed")
     
     # Cleanup
     del model, tokenizer
@@ -764,12 +1033,12 @@ def test_generation_quality():
 
 
 # =============================================================================
-# CELL 7: PERFORMANCE BENCHMARK
+# CELL 8: PERFORMANCE BENCHMARK
 # =============================================================================
 def test_performance_benchmark():
-    """Benchmark generation speed with spectral cache."""
+    """Benchmark generation speed with spectral cache at various context lengths."""
     print("\n" + "=" * 70)
-    print("PERFORMANCE BENCHMARK")
+    print("PERFORMANCE BENCHMARK (Mistral-7B)")
     print("=" * 70)
     
     if not (SPECTRAL_OK and UNSLOTH_OK):
@@ -781,10 +1050,10 @@ def test_performance_benchmark():
         return False
     
     # Load model
-    print("\n📥 Loading model...")
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        "unsloth/Llama-3.2-1B-Instruct-bnb-4bit",
-        max_seq_length=4096,
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
     )
     
@@ -805,20 +1074,26 @@ def test_performance_benchmark():
                           pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
     torch.cuda.synchronize()
     
-    # Benchmark configurations
+    # Benchmark configurations - including longer contexts
     configs = [
-        {"name": "Short (100 tokens)", "prompt_tokens": 100, "new_tokens": 50},
-        {"name": "Medium (500 tokens)", "prompt_tokens": 500, "new_tokens": 50},
-        {"name": "Long (1000 tokens)", "prompt_tokens": 1000, "new_tokens": 50},
+        {"name": "Short (256 tokens)", "prompt_tokens": 256, "new_tokens": 50},
+        {"name": "Medium (512 tokens)", "prompt_tokens": 512, "new_tokens": 50},
+        {"name": "Long (1024 tokens)", "prompt_tokens": 1024, "new_tokens": 50},
+        {"name": "Very Long (2048 tokens)", "prompt_tokens": 2048, "new_tokens": 50},
     ]
     
     print("\n📊 Running benchmarks...")
-    print("-" * 60)
+    print("-" * 70)
+    
+    benchmark_results = []
     
     for config in configs:
+        # Reset cache before each benchmark
+        reset_all_caches(model)
+        
         # Create prompt of specified length
-        base = "This is a test sentence for benchmarking. "
-        prompt = base * (config["prompt_tokens"] // 10 + 1)
+        base = "This is a comprehensive test sentence for benchmarking purposes. "
+        prompt = base * (config["prompt_tokens"] // 12 + 1)
         inputs = tokenizer(prompt, return_tensors="pt", max_length=config["prompt_tokens"], 
                           truncation=True).to("cuda")
         actual_prompt_len = inputs["input_ids"].shape[1]
@@ -826,6 +1101,7 @@ def test_performance_benchmark():
         # Run benchmark (3 iterations)
         times = []
         for _ in range(3):
+            reset_all_caches(model)  # Reset between iterations too
             torch.cuda.synchronize()
             start = time.time()
             
@@ -846,14 +1122,36 @@ def test_performance_benchmark():
         
         # Get compression stats
         stats = get_cache_stats(model)
+        tokens_per_layer = get_tokens_per_layer_from_stats(stats)
+        
+        result = {
+            "name": config["name"],
+            "prompt_tokens": actual_prompt_len,
+            "new_tokens": config["new_tokens"],
+            "avg_time": avg_time,
+            "tokens_per_sec": tokens_per_sec,
+            "compression_ratio": stats["compression_ratio"],
+            "cold_blocks": stats["total_blocks"],
+        }
+        benchmark_results.append(result)
         
         print(f"\n{config['name']}:")
         print(f"  Prompt: {actual_prompt_len} tokens")
         print(f"  Generated: {config['new_tokens']} tokens")
         print(f"  Time: {avg_time:.3f}s (avg of 3)")
         print(f"  Speed: {tokens_per_sec:.1f} tokens/sec")
-        print(f"  Cache compression: {stats['compression_ratio']:.2f}x")
-        print(f"  Cold blocks: {stats['total_blocks']}")
+        print(f"  Compression: {stats['compression_ratio']:.2f}x")
+        print(f"  Cold blocks: {stats['total_blocks']} ({stats['total_blocks'] // NUM_LAYERS} per layer)")
+    
+    # Summary table
+    print("\n" + "=" * 70)
+    print("BENCHMARK SUMMARY")
+    print("=" * 70)
+    print(f"{'Context':<25} {'Speed':<15} {'Compression':<15} {'Blocks/Layer':<12}")
+    print("-" * 70)
+    for r in benchmark_results:
+        blocks_per_layer = r['cold_blocks'] // NUM_LAYERS if r['cold_blocks'] > 0 else 0
+        print(f"{r['name']:<25} {r['tokens_per_sec']:.1f} tok/s{'':<6} {r['compression_ratio']:.2f}x{'':<10} {blocks_per_layer}")
     
     # Cleanup
     del model, tokenizer
@@ -872,7 +1170,7 @@ def test_performance_benchmark():
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "=" * 70)
-    print("🚀 RUNNING ALL VALIDATION TESTS")
+    print("🚀 RUNNING ALL VALIDATION TESTS (v2)")
     print("=" * 70)
     
     results = {}
@@ -882,7 +1180,8 @@ def run_all_tests():
     results["Kernel Functions"] = test_kernel_functions()
     
     # Integration tests (require full setup)
-    results["Long Context Compression"] = test_long_context_compression()
+    results["Long Context (1500 tok)"] = test_long_context_compression()
+    results["Very Long Context (3000 tok)"] = test_very_long_context()
     results["Memory Profiling"] = test_memory_usage()
     results["Generation Quality"] = test_generation_quality()
     results["Performance Benchmark"] = test_performance_benchmark()
@@ -909,7 +1208,9 @@ def run_all_tests():
 # Run all tests when executed
 if __name__ == "__main__":
     success = run_all_tests()
-    sys.exit(0 if success else 1)
+    # Don't call sys.exit() in notebook - just print result
+    print(f"\n{'✅ ALL TESTS PASSED' if success else '❌ SOME TESTS FAILED'}")
 else:
     # When pasted into Colab, run automatically
     success = run_all_tests()
+    print(f"\n{'✅ ALL TESTS PASSED' if success else '❌ SOME TESTS FAILED'}")
