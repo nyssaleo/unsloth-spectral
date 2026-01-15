@@ -764,9 +764,17 @@ def patch_unsloth_attention(
             layer.self_attn.forward = spectral_fwd.__get__(layer.self_attn, type(layer.self_attn))
             num_patched += 1
     
-    # CRITICAL: Also patch the INFERENCE function for decode path!
-    # Unsloth uses a separate fast_forward_inference function for single-token decode
-    # that bypasses the regular forward. We need to patch that too.
+    # CRITICAL: Patch the INFERENCE function for decode path!
+    # 
+    # IMPORTANT BUG FIX (Jan 2026):
+    # Unsloth's LlamaModel_fast_forward_inference captures LlamaAttention_fast_forward_inference
+    # as a default parameter at IMPORT TIME. Simply patching the module-level function
+    # doesn't update the closure reference that LlamaModel_fast_forward_inference uses!
+    #
+    # We must:
+    # 1. Patch LlamaAttention_fast_forward_inference (for direct callers)
+    # 2. RECREATE LlamaModel_fast_forward_inference with our patched function
+    #    (this updates the closure reference)
     try:
         import unsloth.models.llama as llama_module
         
@@ -778,14 +786,27 @@ def patch_unsloth_attention(
             hot_buffer_size=hot_buffer_size,
             use_spectral_attention=use_spectral_attention,
             debug_logging=debug_logging,
-            use_triton_kernel=use_triton_kernel,  # Pass through Triton flag
+            use_triton_kernel=use_triton_kernel,
         )
         
-        # Monkey-patch the module-level function
+        # Step 1: Patch the attention-level function (for direct callers)
         llama_module.LlamaAttention_fast_forward_inference = spectral_inference_fn
         
-        if verbose:
-            print(f"✅ Patched decode inference path (LlamaAttention_fast_forward_inference)")
+        # Step 2: CRITICAL - Recreate LlamaModel_fast_forward_inference with our patched attention
+        # The original is created at import time and captures the OLD attention function in its closure.
+        # We must recreate it to update the closure reference.
+        if hasattr(llama_module, '_LlamaModel_fast_forward_inference'):
+            # Recreate with our patched attention function
+            llama_module.LlamaModel_fast_forward_inference = llama_module._LlamaModel_fast_forward_inference(
+                attention_fast_forward_inference=spectral_inference_fn
+            )
+            if verbose:
+                print(f"✅ Patched decode inference path (LlamaAttention + LlamaModel_fast_forward_inference)")
+        else:
+            if verbose:
+                print(f"✅ Patched decode inference path (LlamaAttention_fast_forward_inference only)")
+                print(f"   ⚠️ Could not find _LlamaModel_fast_forward_inference - model inference may use old path")
+                
     except Exception as e:
         print(f"⚠️  Warning: Could not patch inference function: {e}")
         print(f"   Decode steps may not use spectral cache correctly.")
