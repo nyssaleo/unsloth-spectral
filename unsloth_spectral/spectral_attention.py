@@ -182,34 +182,37 @@ def spectral_attention_forward(
             coeffs_K = repeat_kv_spectral(coeffs_K, n_rep)  # [H_q, T_block, k]
             basis_K = repeat_kv_spectral(basis_K, n_rep)    # [H_q, k, D]
         
-        # Step 1: Compute relative positions for this block
+        # Step 1: Identify ABSOLUTE positions of keys in this block
         # Key positions: [start_pos, start_pos+1, ..., start_pos+T_block-1]
-        # Distance from query to key: query_position - key_pos (MUST BE POSITIVE!)
         key_positions = torch.arange(start_pos, start_pos + T_block, device=Q.device, dtype=torch.long)
         
-        # CRITICAL FIX: Use positive distances to avoid negative indexing bug
-        # Previous bug: relative_positions = key_positions - query_position (negative!)
-        # PyTorch interprets cos[-1200] as cos[8192-1200] = cos[6992] ❌
-        # Correct: distances = query_position - key_positions (positive!)
-        distances = (query_position - key_positions).clamp(min=0).long()  # [T_block]
+        # Step 2: Extract RoPE cos/sin for KEY'S ABSOLUTE POSITIONS
+        # CRITICAL: We use key_positions directly, NOT distances!
+        # This applies R(-θ_n) to Q, transforming it to align with unrotated keys
+        # Net effect: R(-θ_n) @ R(θ_m) @ Q_raw = R(θ_m - θ_n) @ Q_raw ✅
+        #
+        # Previous bug: Used distances = query_position - key_positions
+        # This applied R(-θ_{m-n}), resulting in R(θ_n) - WRONG! Destroyed relative info.
         
-        # Step 2: Extract RoPE cos/sin for the DISTANCE
-        # cos, sin are [MaxLen, D], we need [T_block, D]
-        # RoPE property: R(θ_m - θ_n) requires rotation by distance d = m - n
-        cos_relative = cos[distances]  # [T_block, D]
-        sin_relative = sin[distances]  # [T_block, D]
+        # Ensure we don't index out of bounds
+        max_idx = cos.shape[0]
+        if (key_positions >= max_idx).any():
+            # Safety clamp (shouldn't happen if RoPE cache managed correctly)
+            key_positions = key_positions.clamp(max=max_idx-1)
         
-        # Step 3: Apply INVERSE RoPE to Q for each key position
-        # Q is [B, H, 1, D] - already rotated by query_position
-        # We need to generate T_block variants of Q, each aligned with a key
-        # Q_aligned[i] = apply_rope(Q, cos[relative[i]], -sin[relative[i]])
+        cos_keys = cos[key_positions]  # [T_block, D] - cos(θ_n) for each key
+        sin_keys = sin[key_positions]  # [T_block, D] - sin(θ_n) for each key
+        
+        # Step 3: Apply INVERSE RoPE using key's absolute position
+        # Q is [B, H, 1, D] - already rotated by θ_query_position
+        # We rotate it by -θ_key_position to align with unrotated keys
         
         # Broadcast Q to [B, H_q, T_block, D]
-        Q_broadcast = Q.expand(B, H_q, T_block, D)  # [B, H_q, T_block, D]
+        Q_broadcast = Q.expand(B, H_q, T_block, D)
         
         # Broadcast cos/sin to [B, H, T_block, D]
-        cos_batch = cos_relative.unsqueeze(0).unsqueeze(0)  # [1, 1, T_block, D]
-        sin_batch = sin_relative.unsqueeze(0).unsqueeze(0)  # [1, 1, T_block, D]
+        cos_batch = cos_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T_block, D]
+        sin_batch = sin_keys.unsqueeze(0).unsqueeze(0)  # [1, 1, T_block, D]
         
         # Apply inverse rotation (note: -sin for inverse)
         Q_aligned = apply_rope(Q_broadcast, cos_batch, -sin_batch)  # [B, H, T_block, D]
@@ -218,13 +221,21 @@ def spectral_attention_forward(
         # Q_aligned @ B_K^T: [B, H, T_block, D] @ [H, k, D]^T -> [B, H, T_block, k]
         basis_K_batched = basis_K.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, k, D]
         
+        # CRITICAL: Use FP32 for einsum (NOT on autocast whitelist)
+        # Research finding: einsum with mixed FP16/FP32 can overflow or produce incorrect results
+        # Compute in FP32 for numerical stability, then convert back to model dtype
+        model_dtype = Q.dtype
+        Q_aligned_fp32 = Q_aligned.float()
+        basis_K_batched_fp32 = basis_K_batched.float()
+        
         # Use einsum for clarity: bhTd,bhkd->bhTk
-        Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned, basis_K_batched)  # [B, H, T_block, k]
+        Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned_fp32, basis_K_batched_fp32)  # [B, H, T_block, k]
         
         # Step 5: Compute scores via element-wise dot product with coefficients
         # Q_latent * C_K: [B, H, T_block, k] * [H, T_block, k] -> sum over k -> [B, H, T_block]
-        coeffs_K_batched = coeffs_K.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, T_block, k]
+        coeffs_K_batched = coeffs_K.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, T_block, k] in FP32
         scores_block = torch.sum(Q_latent * coeffs_K_batched, dim=-1)  # [B, H, T_block]
+        scores_block = scores_block.to(model_dtype)  # Convert back to model dtype
         scores_block = scores_block.unsqueeze(2)  # [B, H, 1, T_block] for concatenation
         
         scores_parts.append(scores_block)
@@ -304,15 +315,21 @@ def spectral_attention_forward(
         # C_V: [H, T_block, k]
         # B_V: [H, k, D]
         
+        # CRITICAL: Use FP32 for matmul to avoid numerical issues
+        # Research finding: FP16 dot products can overflow for large dimensions
+        model_dtype = Q.dtype
+        
         # Step 1: Aggregate temporal coefficients
         # attn @ C_V: [B, H, 1, T_block] @ [H, T_block, k] -> [B, H, 1, k]
-        coeffs_V_batched = coeffs_V.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, T_block, k]
-        v_proj = torch.matmul(attn_block, coeffs_V_batched)  # [B, H, 1, k]
+        coeffs_V_batched = coeffs_V.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, T_block, k] FP32
+        attn_block_fp32 = attn_block.float()
+        v_proj = torch.matmul(attn_block_fp32, coeffs_V_batched)  # [B, H, 1, k]
         
         # Step 2: Project back to feature space
         # v_proj @ B_V: [B, H, 1, k] @ [H, k, D] -> [B, H, 1, D]
-        basis_V_batched = basis_V.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, k, D]
+        basis_V_batched = basis_V.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, k, D] FP32
         output_block = torch.matmul(v_proj, basis_V_batched)  # [B, H, 1, D]
+        output_block = output_block.to(model_dtype)  # Convert back to model dtype
         
         output_parts.append(output_block)
     

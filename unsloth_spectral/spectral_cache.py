@@ -306,7 +306,11 @@ class SpectralCache:
         # Batched quantization (vectorized per-head)
         coeffs_q, scales = self._quantize_int8_batched(coeffs)
         
-        # Keep basis in FP16 (it's small, no need to quantize)
+        # CRITICAL FIX: Convert ALL components back to model dtype (BF16/FP16)
+        # SVD computes in FP32 for numerical stability, but we need matching
+        # dtypes for downstream operations (einsum, matmul with model tensors)
+        # Research finding: einsum NOT on autocast whitelist, requires explicit dtype match
+        coeffs_q = coeffs_q.to(self.dtype)
         basis = basis.to(self.dtype)
         
         return coeffs_q, basis, scales
@@ -343,7 +347,8 @@ class SpectralCache:
             coeffs_h = U_k * S_k.unsqueeze(0)
             coeffs_q, scale = self._quantize_int8(coeffs_h)
             
-            coeffs_list.append(coeffs_q)
+            # CRITICAL FIX: Convert coeffs to model dtype (matching basis)
+            coeffs_list.append(coeffs_q.to(self.dtype))
             basis_list.append(Vh_k.to(self.dtype))
             scales_list.append(scale)
         

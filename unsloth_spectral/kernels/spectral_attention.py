@@ -427,17 +427,22 @@ def spectral_score_forward_pytorch(
         # coeffs_K: [H_kv, T_block, k_K] -> [H_q, T_block, k_K]
         coeffs_K = coeffs_K.repeat_interleave(n_rep, dim=0)
     
+    # CRITICAL: Use FP32 for einsum (NOT on autocast whitelist)
+    # Research finding: einsum with mixed precision can overflow/produce incorrect results
+    model_dtype = Q.dtype
+    
     # Project Q into spectral space
     # Q_latent = Q_aligned @ basis_K^T : [B, H_q, T_block, D] @ [H_q, k_K, D]^T
     # Using einsum: Q_latent[b,h,t,k] = sum_d(Q_aligned[b,h,t,d] * basis_K[h,k,d])
-    basis_K_batch = basis_K.unsqueeze(0)  # [1, H_q, k_K, D]
-    Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned, basis_K_batch.expand(B, -1, -1, -1))  # [B, H_q, T_block, k_K]
+    basis_K_batch = basis_K.unsqueeze(0).float()  # [1, H_q, k_K, D] in FP32
+    Q_aligned_fp32 = Q_aligned.float()
+    Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned_fp32, basis_K_batch.expand(B, -1, -1, -1))  # [B, H_q, T_block, k_K]
     
     # Compute scores: element-wise multiply with coeffs and sum
     # scores[b,h,1,t] = sum_k(Q_latent[b,h,t,k] * coeffs_K[h,t,k])
-    coeffs_K_batch = coeffs_K.unsqueeze(0)  # [1, H_q, T_block, k_K]
+    coeffs_K_batch = coeffs_K.unsqueeze(0).float()  # [1, H_q, T_block, k_K] in FP32
     scores = torch.sum(Q_latent * coeffs_K_batch.expand(B, -1, -1, -1), dim=-1)  # [B, H_q, T_block]
-    scores = scores.unsqueeze(2)  # [B, H_q, 1, T_block]
+    scores = scores.unsqueeze(2).to(model_dtype)  # [B, H_q, 1, T_block] back to model dtype
     
     if config.enable_logging:
         elapsed_us = (time.perf_counter() - start_time) * 1e6
@@ -568,17 +573,23 @@ def spectral_value_forward_pytorch(
         coeffs_V = coeffs_V.repeat_interleave(n_rep, dim=0)  # [H_q, T_block, k_V]
         basis_V = basis_V.repeat_interleave(n_rep, dim=0)    # [H_q, k_V, D]
     
+    # CRITICAL: Use FP32 for einsum (NOT on autocast whitelist)
+    # Research finding: einsum with mixed precision can overflow/produce incorrect results
+    model_dtype = attn.dtype
+    
     # Step 1: v_latent = attn @ coeffs_V
     # attn: [B, H_q, 1, T_block], coeffs_V: [H_q, T_block, k_V]
     # v_latent[b,h,1,k] = sum_t(attn[b,h,1,t] * coeffs_V[h,t,k])
-    coeffs_V_batch = coeffs_V.unsqueeze(0)  # [1, H_q, T_block, k_V]
-    v_latent = torch.einsum('bhst,bhtk->bhsk', attn, coeffs_V_batch.expand(B, -1, -1, -1))  # [B, H_q, 1, k_V]
+    coeffs_V_batch = coeffs_V.unsqueeze(0).float()  # [1, H_q, T_block, k_V] in FP32
+    attn_fp32 = attn.float()
+    v_latent = torch.einsum('bhst,bhtk->bhsk', attn_fp32, coeffs_V_batch.expand(B, -1, -1, -1))  # [B, H_q, 1, k_V]
     
     # Step 2: output = v_latent @ basis_V
     # v_latent: [B, H_q, 1, k_V], basis_V: [H_q, k_V, D]
     # output[b,h,1,d] = sum_k(v_latent[b,h,1,k] * basis_V[h,k,d])
-    basis_V_batch = basis_V.unsqueeze(0)  # [1, H_q, k_V, D]
+    basis_V_batch = basis_V.unsqueeze(0).float()  # [1, H_q, k_V, D] in FP32
     output = torch.einsum('bhsk,bhkd->bhsd', v_latent, basis_V_batch.expand(B, -1, -1, -1))  # [B, H_q, 1, D]
+    output = output.to(model_dtype)  # Convert back to model dtype
     
     if config.enable_logging:
         elapsed_us = (time.perf_counter() - start_time) * 1e6
