@@ -770,9 +770,10 @@ def spectral_attention_decode(
         cos_hot = cos[hot_positions].unsqueeze(0).unsqueeze(0)  # [1, 1, T_hot, D]
         sin_hot = sin[hot_positions].unsqueeze(0).unsqueeze(0)
         
-        # RoPE: K_rotated = K * cos + rotate_half(K) * sin
-        # Simplified: K_rotated ≈ K * cos (full RoPE needs rotate_half)
-        hot_K_rotated = hot_K * cos_hot  # Simplified
+        # CRITICAL FIX: Use proper RoPE rotation, not simplified approximation!
+        # The simplified version (K * cos) was causing attention corruption
+        # which cascaded into NaN values and model degeneration.
+        hot_K_rotated = _apply_rope(hot_K, cos_hot, sin_hot)  # Proper RoPE!
         
         # GQA expand
         if n_rep > 1:

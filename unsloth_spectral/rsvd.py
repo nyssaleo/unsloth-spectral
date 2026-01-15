@@ -74,10 +74,17 @@ def batched_randomized_svd(
     B, m, n = M.shape
     r = min(k + oversampling, min(m, n))  # Oversampled rank
     
+    # CRITICAL: SVD operations require FP32 for numerical stability
+    # QR decomposition ("geqrf_cuda") doesn't support Half precision
+    original_dtype = M.dtype
+    if M.dtype in (torch.float16, torch.bfloat16):
+        M = M.float()  # Convert to FP32 for computation
+    
     # Edge case: if k is too large, fall back to standard SVD
     if r >= min(m, n) - 1:
         U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-        return U[:, :, :k], S[:, :k], Vh[:, :k, :]
+        # Convert back to original dtype
+        return U[:, :, :k].to(original_dtype), S[:, :k].to(original_dtype), Vh[:, :k, :].to(original_dtype)
     
     # =========================================================================
     # STAGE 1: Random Sampling (Capture Column Space)
@@ -85,7 +92,7 @@ def batched_randomized_svd(
     
     # Generate random test matrix Omega: [B, n, r]
     # We use Gaussian random projection (most common choice)
-    Omega = torch.randn(B, n, r, device=M.device, dtype=M.dtype)
+    Omega = torch.randn(B, n, r, device=M.device, dtype=M.dtype)  # FP32 now
     
     # Compute sampling matrix: Y = M @ Omega
     # This captures the action of M on random vectors
@@ -146,7 +153,8 @@ def batched_randomized_svd(
     # =========================================================================
     
     # Truncate to exact rank k (discard oversampled dimensions)
-    return U[:, :, :k], S[:, :k], Vh[:, :k, :]
+    # Convert back to original dtype (FP16/BF16 if that was the input)
+    return U[:, :, :k].to(original_dtype), S[:, :k].to(original_dtype), Vh[:, :k, :].to(original_dtype)
 
 
 def test_randomized_svd_correctness():
