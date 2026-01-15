@@ -1165,12 +1165,327 @@ def test_performance_benchmark():
 
 
 # =============================================================================
+# CELL 9: NEEDLE-IN-HAYSTACK RECALL TEST (Enhanced)
+# =============================================================================
+def test_needle_recall():
+    """
+    Comprehensive needle-in-haystack test for compressed context.
+    
+    Tests:
+    1. Needle at different positions (early, middle, late)
+    2. Different context lengths (1K, 2K, 3K tokens)
+    3. Compression vs non-compression comparison
+    """
+    print("\n" + "=" * 70)
+    print("NEEDLE-IN-HAYSTACK RECALL TEST")
+    print("=" * 70)
+    
+    if not (SPECTRAL_OK and UNSLOTH_OK):
+        print("❌ Skipping: Required modules not available")
+        return False
+    
+    if not torch.cuda.is_available():
+        print("❌ Skipping: CUDA not available")
+        return False
+    
+    # Load model
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True,
+    )
+    
+    patch_unsloth_attention(
+        model,
+        block_size=512,
+        k_rank_keys=16,
+        k_rank_values=32,
+        verbose=True,
+        debug_logging=False,
+    )
+    
+    # Filler text
+    filler_unit = """Machine learning is a subset of artificial intelligence that enables 
+    computers to learn from data without being explicitly programmed. Neural networks 
+    are computational models inspired by biological neurons. Deep learning uses multiple 
+    layers to progressively extract higher-level features from raw input. """
+    
+    # Test configurations
+    needle_tests = [
+        {
+            "name": "1K tokens, needle at ~200",
+            "total_tokens": 1000,
+            "needle_position": 0.2,  # 20% into the context
+            "needle": "The password for the vault is RUBY-2847.",
+            "question": "What is the password for the vault?",
+            "expected": ["RUBY-2847", "ruby-2847", "RUBY", "2847"],
+        },
+        {
+            "name": "2K tokens, needle at middle",
+            "total_tokens": 2000,
+            "needle_position": 0.5,  # 50% into the context
+            "needle": "Agent Smith's codename is PHOENIX-0099.",
+            "question": "What is Agent Smith's codename?",
+            "expected": ["PHOENIX-0099", "phoenix-0099", "PHOENIX", "0099"],
+        },
+        {
+            "name": "3K tokens, needle at ~80%",
+            "total_tokens": 3000,
+            "needle_position": 0.8,  # 80% into the context (late)
+            "needle": "The treasure is buried at coordinates LAT-42 LON-73.",
+            "question": "Where is the treasure buried? What are the coordinates?",
+            "expected": ["LAT-42", "LON-73", "42", "73"],
+        },
+    ]
+    
+    results = []
+    
+    for test in needle_tests:
+        print(f"\n--- {test['name']} ---")
+        
+        # Reset cache
+        reset_all_caches(model)
+        
+        # Build context with needle
+        target_chars = test["total_tokens"] * 4  # Rough char estimate
+        needle_char_pos = int(target_chars * test["needle_position"])
+        
+        # Build filler
+        filler = ""
+        while len(filler) < target_chars:
+            filler += filler_unit
+        filler = filler[:target_chars]
+        
+        # Insert needle
+        context = filler[:needle_char_pos] + f"\n[IMPORTANT: {test['needle']}]\n" + filler[needle_char_pos:]
+        
+        # Build prompt with question
+        full_prompt = context + f"\n\nQuestion: {test['question']}\nAnswer:"
+        
+        # Tokenize and check length
+        inputs = tokenizer(full_prompt, return_tensors="pt", max_length=test["total_tokens"] + 100, truncation=True).to("cuda")
+        actual_tokens = inputs["input_ids"].shape[1]
+        print(f"  Context: {actual_tokens} tokens")
+        print(f"  Needle inserted at: ~{test['needle_position']*100:.0f}% ({needle_char_pos} chars)")
+        
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=30,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+        
+        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        print(f"  Response: {response[:80]}...")
+        
+        # Check cache stats
+        stats = get_cache_stats(model)
+        blocks_per_layer = stats['total_blocks'] // NUM_LAYERS if stats['total_blocks'] > 0 else 0
+        print(f"  Compression: {stats['compression_ratio']:.2f}x ({blocks_per_layer} blocks/layer)")
+        
+        # Check recall
+        recall_found = any(exp in response for exp in test["expected"])
+        partial_found = any(exp.lower() in response.lower() for exp in test["expected"])
+        
+        if recall_found:
+            print(f"  ✅ PERFECT RECALL")
+            status = "perfect"
+        elif partial_found:
+            print(f"  ⚠️ PARTIAL RECALL")
+            status = "partial"
+        else:
+            print(f"  ❌ NO RECALL")
+            status = "failed"
+        
+        results.append({
+            "name": test["name"],
+            "tokens": actual_tokens,
+            "blocks": blocks_per_layer,
+            "compression": stats['compression_ratio'],
+            "status": status,
+        })
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("NEEDLE RECALL SUMMARY")
+    print("=" * 70)
+    print(f"{'Test':<35} {'Tokens':<10} {'Blocks':<10} {'Compression':<12} {'Recall':<10}")
+    print("-" * 70)
+    
+    perfect_count = 0
+    for r in results:
+        status_icon = {"perfect": "✅", "partial": "⚠️", "failed": "❌"}[r["status"]]
+        print(f"{r['name']:<35} {r['tokens']:<10} {r['blocks']:<10} {r['compression']:.2f}x{'':<7} {status_icon}")
+        if r["status"] == "perfect":
+            perfect_count += 1
+    
+    print("-" * 70)
+    print(f"Perfect Recalls: {perfect_count}/{len(results)}")
+    
+    # Cleanup
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print("\n" + "=" * 70)
+    print("NEEDLE RECALL TEST: ✅ COMPLETE")
+    print("=" * 70)
+    
+    return perfect_count >= len(results) // 2  # Pass if at least half are perfect
+
+
+# =============================================================================
+# CELL 10: MEMORY BREAKDOWN ANALYSIS
+# =============================================================================
+def test_memory_breakdown():
+    """
+    Detailed analysis of where memory goes during generation.
+    
+    Breaks down:
+    1. Model weights
+    2. KV cache (theoretical vs actual)
+    3. Activations and intermediate tensors
+    4. Generation overhead
+    """
+    print("\n" + "=" * 70)
+    print("MEMORY BREAKDOWN ANALYSIS")
+    print("=" * 70)
+    
+    if not (SPECTRAL_OK and UNSLOTH_OK):
+        print("❌ Skipping: Required modules not available")
+        return False
+    
+    if not torch.cuda.is_available():
+        print("❌ Skipping: CUDA not available")
+        return False
+    
+    def get_memory_mb():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated() / 1024**2
+    
+    def get_reserved_mb():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_reserved() / 1024**2
+    
+    # Clean slate
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    
+    memory_log = []
+    memory_log.append(("Baseline (empty)", get_memory_mb(), get_reserved_mb()))
+    
+    # Load model
+    print(f"\n📥 Loading model: {MODEL_NAME}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        MODEL_NAME,
+        max_seq_length=MAX_SEQ_LENGTH,
+        load_in_4bit=True,
+    )
+    memory_log.append(("After model load", get_memory_mb(), get_reserved_mb()))
+    
+    # Patch with spectral cache
+    patch_unsloth_attention(
+        model,
+        block_size=512,
+        k_rank_keys=16,
+        k_rank_values=32,
+        verbose=True,
+        debug_logging=False,
+    )
+    memory_log.append(("After patching", get_memory_mb(), get_reserved_mb()))
+    
+    # Create test prompt (2048 tokens)
+    test_text = "The quick brown fox jumps over the lazy dog. " * 300
+    inputs = tokenizer(test_text, return_tensors="pt", max_length=2048, truncation=True).to("cuda")
+    prompt_tokens = inputs["input_ids"].shape[1]
+    memory_log.append((f"After tokenization ({prompt_tokens} tok)", get_memory_mb(), get_reserved_mb()))
+    
+    # Pre-generation
+    torch.cuda.reset_peak_memory_stats()
+    
+    # Generation
+    print(f"\n🔄 Generating 100 tokens from {prompt_tokens} token prompt...")
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=100,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+    
+    memory_log.append(("After generation", get_memory_mb(), get_reserved_mb()))
+    peak_mb = torch.cuda.max_memory_allocated() / 1024**2
+    
+    # Get cache stats
+    stats = get_cache_stats(model)
+    tokens_per_layer = get_tokens_per_layer_from_stats(stats)
+    
+    # Print memory log
+    print("\n" + "=" * 70)
+    print("MEMORY ALLOCATION LOG")
+    print("=" * 70)
+    print(f"{'Stage':<35} {'Allocated (MB)':<18} {'Reserved (MB)':<18}")
+    print("-" * 70)
+    
+    for stage, alloc, reserved in memory_log:
+        print(f"{stage:<35} {alloc:>12.1f}{'':<6} {reserved:>12.1f}")
+    
+    print(f"{'Peak during generation':<35} {peak_mb:>12.1f}")
+    
+    # Memory breakdown calculation
+    print("\n" + "=" * 70)
+    print("MEMORY BREAKDOWN")
+    print("=" * 70)
+    
+    model_memory = memory_log[1][0] - memory_log[0][0]
+    generation_overhead = memory_log[4][0] - memory_log[3][0]
+    peak_overhead = peak_mb - memory_log[3][0]
+    
+    # KV cache calculations
+    theoretical_kv_bytes = calculate_theoretical_kv_size(tokens_per_layer)
+    actual_kv_bytes = stats.get('total_compressed_bytes', 0)
+    
+    print(f"  Model weights (4-bit):           {model_memory:>8.1f} MB")
+    print(f"  ")
+    print(f"  KV Cache Analysis ({tokens_per_layer} tokens/layer):")
+    print(f"    Theoretical (FP16):            {theoretical_kv_bytes / 1024**2:>8.2f} MB")
+    print(f"    Actual (compressed):           {actual_kv_bytes / 1024**2:>8.2f} MB")
+    print(f"    Compression ratio:             {stats['compression_ratio']:>8.2f}x")
+    print(f"    Cold blocks:                   {stats['total_blocks']:>8} ({stats['total_blocks'] // NUM_LAYERS}/layer)")
+    print(f"  ")
+    print(f"  Generation overhead:")
+    print(f"    Final - Pre-gen:               {generation_overhead:>8.1f} MB")
+    print(f"    Peak - Pre-gen:                {peak_overhead:>8.1f} MB")
+    print(f"  ")
+    print(f"  Non-KV overhead (activations, etc):")
+    print(f"    = Peak overhead - KV cache")
+    non_kv_overhead = peak_overhead - (actual_kv_bytes / 1024**2)
+    print(f"    = {peak_overhead:.1f} - {actual_kv_bytes / 1024**2:.1f} = {non_kv_overhead:.1f} MB")
+    
+    # Cleanup
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print("\n" + "=" * 70)
+    print("MEMORY BREAKDOWN: ✅ COMPLETE")
+    print("=" * 70)
+    return True
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "=" * 70)
-    print("🚀 RUNNING ALL VALIDATION TESTS (v2)")
+    print("🚀 RUNNING ALL VALIDATION TESTS (v3 - Multi-Block Fix)")
     print("=" * 70)
     
     results = {}
@@ -1182,7 +1497,8 @@ def run_all_tests():
     # Integration tests (require full setup)
     results["Long Context (1500 tok)"] = test_long_context_compression()
     results["Very Long Context (3000 tok)"] = test_very_long_context()
-    results["Memory Profiling"] = test_memory_usage()
+    results["Memory Breakdown"] = test_memory_breakdown()
+    results["Needle Recall"] = test_needle_recall()
     results["Generation Quality"] = test_generation_quality()
     results["Performance Benchmark"] = test_performance_benchmark()
     

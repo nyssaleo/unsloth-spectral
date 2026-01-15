@@ -204,58 +204,81 @@ class SpectralCache:
     
     def _compress_hot_cache(self):
         """
-        Compress the hot cache into a spectral block and move to cold storage.
+        Compress the hot cache into spectral blocks and move to cold storage.
+        
+        CRITICAL FIX (Jan 2026): Now uses WHILE loop to compress ALL complete blocks,
+        not just the first one. This is essential for long contexts!
         
         Algorithm:
-        1. Extract exactly block_size tokens from hot cache
-        2. Perform per-head SVD: K_h = U @ S @ Vh^T
-        3. Truncate to rank k: coeffs = U_k @ S_k, basis = V_k^T
-        4. Quantize coefficients to INT8 (simulated)
-        5. Store SpectralBlock in cold_blocks
-        6. Keep remaining tokens in hot cache
+        1. WHILE hot cache has >= block_size tokens:
+           a. Extract exactly block_size tokens from hot cache
+           b. Perform per-head SVD: K_h = U @ S @ Vh^T
+           c. Truncate to rank k: coeffs = U_k @ S_k, basis = V_k^T
+           d. Quantize coefficients to INT8 (simulated)
+           e. Store SpectralBlock in cold_blocks
+           f. Keep remaining tokens in hot cache
+        2. Continue until hot cache < block_size
+        
+        Example: 3500 tokens with block_size=512
+        - Before fix: 1 block compressed, 2988 tokens stay hot
+        - After fix: 6 blocks compressed, 428 tokens stay hot
         """
-        if self.hot_K is None or self.hot_K.shape[2] < self.block_size:
-            return
+        # WHILE loop to compress ALL complete blocks (THE FIX!)
+        blocks_compressed_this_call = 0
         
-        # Extract block to compress
-        K_block = self.hot_K[:, :, :self.block_size, :]  # [B, H, T, D]
-        V_block = self.hot_V[:, :, :self.block_size, :]
-        
-        # Get start position for this block
-        if self.hot_position_ids is not None:
-            start_position = self.hot_position_ids[0, 0].item()
-        else:
-            # Fallback: calculate from existing blocks
-            start_position = sum(block.block_size for block in self.cold_blocks)
-        
-        # Compress K and V separately (asymmetric ranks)
-        coeffs_K, basis_K, scales_K = self._compress_tensor(K_block, self.k_rank_keys)
-        coeffs_V, basis_V, scales_V = self._compress_tensor(V_block, self.k_rank_values)
-        
-        # Create spectral block
-        block = SpectralBlock(
-            coeffs_K=coeffs_K,
-            basis_K=basis_K,
-            coeffs_V=coeffs_V,
-            basis_V=basis_V,
-            scales_K=scales_K,
-            scales_V=scales_V,
-            block_size=self.block_size,
-            start_position=start_position,  # NEW: Track position for RoPE
-        )
-        self.cold_blocks.append(block)
-        self.compression_count += 1
-        
-        # Keep only the remainder in hot cache
-        if self.hot_K.shape[2] > self.block_size:
-            self.hot_K = self.hot_K[:, :, self.block_size:, :].contiguous()
-            self.hot_V = self.hot_V[:, :, self.block_size:, :].contiguous()
+        while self.hot_K is not None and self.hot_K.shape[2] >= self.block_size:
+            # Extract block to compress
+            K_block = self.hot_K[:, :, :self.block_size, :]  # [B, H, T, D]
+            V_block = self.hot_V[:, :, :self.block_size, :]
+            
+            # Get start position for this block
             if self.hot_position_ids is not None:
-                self.hot_position_ids = self.hot_position_ids[:, self.block_size:].contiguous()
-        else:
-            self.hot_K = None
-            self.hot_V = None
-            self.hot_position_ids = None
+                start_position = self.hot_position_ids[0, 0].item()
+            else:
+                # Fallback: calculate from existing blocks
+                start_position = sum(block.block_size for block in self.cold_blocks)
+            
+            if self.debug_logging:
+                print(f"  [_compress_hot_cache] Compressing block {len(self.cold_blocks)}: "
+                      f"tokens [{start_position}:{start_position + self.block_size}], "
+                      f"hot_remaining={self.hot_K.shape[2] - self.block_size}")
+            
+            # Compress K and V separately (asymmetric ranks)
+            coeffs_K, basis_K, scales_K = self._compress_tensor(K_block, self.k_rank_keys)
+            coeffs_V, basis_V, scales_V = self._compress_tensor(V_block, self.k_rank_values)
+            
+            # Create spectral block
+            block = SpectralBlock(
+                coeffs_K=coeffs_K,
+                basis_K=basis_K,
+                coeffs_V=coeffs_V,
+                basis_V=basis_V,
+                scales_K=scales_K,
+                scales_V=scales_V,
+                block_size=self.block_size,
+                start_position=start_position,
+            )
+            self.cold_blocks.append(block)
+            self.compression_count += 1
+            blocks_compressed_this_call += 1
+            
+            # Keep only the remainder in hot cache
+            if self.hot_K.shape[2] > self.block_size:
+                self.hot_K = self.hot_K[:, :, self.block_size:, :].contiguous()
+                self.hot_V = self.hot_V[:, :, self.block_size:, :].contiguous()
+                if self.hot_position_ids is not None:
+                    self.hot_position_ids = self.hot_position_ids[:, self.block_size:].contiguous()
+            else:
+                # All tokens compressed, hot cache is empty
+                self.hot_K = None
+                self.hot_V = None
+                self.hot_position_ids = None
+                break  # Exit loop when hot cache is empty
+        
+        if self.debug_logging and blocks_compressed_this_call > 0:
+            hot_tokens = self.hot_K.shape[2] if self.hot_K is not None else 0
+            print(f"  [_compress_hot_cache] Compressed {blocks_compressed_this_call} blocks, "
+                  f"total_cold={len(self.cold_blocks)}, hot_remaining={hot_tokens}")
     
     def _compress_tensor(
         self, 
