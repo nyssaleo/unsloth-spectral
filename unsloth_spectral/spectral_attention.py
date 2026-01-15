@@ -149,6 +149,10 @@ def spectral_attention_forward(
     """
     B, H_q, _, D = Q.shape
     
+    # Preserve model dtype for consistent output
+    # All FP32 intermediate computations will be converted back to this dtype
+    model_dtype = Q.dtype
+    
     if scale is None:
         scale = 1.0 / math.sqrt(D)
     
@@ -218,14 +222,20 @@ def spectral_attention_forward(
         # Q_aligned @ B_K^T: [B, H, T_block, D] @ [H, k, D]^T -> [B, H, T_block, k]
         basis_K_batched = basis_K.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, k, D]
         
+        # CRITICAL: Use FP32 for einsum computation to avoid overflow/precision loss
+        # Research finding: einsum is NOT on autocast whitelist, requires explicit FP32 cast
+        # This prevents "expected Float but found Half" and FP16 overflow in dot products
+        Q_aligned_f32 = Q_aligned.float()
+        basis_K_f32 = basis_K_batched.float()
+        
         # Use einsum for clarity: bhTd,bhkd->bhTk
-        Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned, basis_K_batched)  # [B, H, T_block, k]
+        Q_latent = torch.einsum('bhtd,bhkd->bhtk', Q_aligned_f32, basis_K_f32)  # [B, H, T_block, k] in FP32
         
         # Step 5: Compute scores via element-wise dot product with coefficients
         # Q_latent * C_K: [B, H, T_block, k] * [H, T_block, k] -> sum over k -> [B, H, T_block]
-        coeffs_K_batched = coeffs_K.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, T_block, k]
-        scores_block = torch.sum(Q_latent * coeffs_K_batched, dim=-1)  # [B, H, T_block]
-        scores_block = scores_block.unsqueeze(2)  # [B, H, 1, T_block] for concatenation
+        coeffs_K_batched = coeffs_K.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, T_block, k] in FP32
+        scores_block = torch.sum(Q_latent * coeffs_K_batched, dim=-1)  # [B, H, T_block] in FP32
+        scores_block = scores_block.unsqueeze(2).to(model_dtype)  # [B, H, 1, T_block] back to model dtype
         
         scores_parts.append(scores_block)
     
@@ -306,13 +316,14 @@ def spectral_attention_forward(
         
         # Step 1: Aggregate temporal coefficients
         # attn @ C_V: [B, H, 1, T_block] @ [H, T_block, k] -> [B, H, 1, k]
-        coeffs_V_batched = coeffs_V.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, T_block, k]
-        v_proj = torch.matmul(attn_block, coeffs_V_batched)  # [B, H, 1, k]
+        # Use FP32 for matmul to ensure numerical stability
+        coeffs_V_batched = coeffs_V.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, T_block, k] FP32
+        v_proj = torch.matmul(attn_block.float(), coeffs_V_batched)  # [B, H, 1, k] FP32
         
         # Step 2: Project back to feature space
         # v_proj @ B_V: [B, H, 1, k] @ [H, k, D] -> [B, H, 1, D]
-        basis_V_batched = basis_V.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, k, D]
-        output_block = torch.matmul(v_proj, basis_V_batched)  # [B, H, 1, D]
+        basis_V_batched = basis_V.unsqueeze(0).expand(B, -1, -1, -1).float()  # [B, H, k, D] FP32
+        output_block = torch.matmul(v_proj, basis_V_batched).to(model_dtype)  # [B, H, 1, D] back to model dtype
         
         output_parts.append(output_block)
     
