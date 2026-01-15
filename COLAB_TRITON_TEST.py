@@ -150,9 +150,8 @@ if TRITON_AVAILABLE:
     scale = 1.0 / math.sqrt(D)
     attn = torch.softmax(scores_pt * scale, dim=-1)
     
-    # FIX: Do NOT squeeze - spectral_value_forward expects [B, H_q, 1, T_block]
     output_pt = spectral_value_forward(
-        attn,  # Keep 4D: [B, H_q, 1, T_block]
+        attn.squeeze(2),  # Remove seq dim
         coeffs_V, basis_V, D,
         config=config,
         use_triton=False,  # PyTorch
