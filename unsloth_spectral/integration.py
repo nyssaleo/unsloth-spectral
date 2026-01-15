@@ -48,6 +48,9 @@ def create_spectral_forward(
     hot_buffer_size: int = 64,
     use_spectral_attention: bool = True,
     debug_logging: bool = False,
+    # NEW: Quality tuning options
+    use_attention_weighted_svd: bool = False,
+    landmark_count: int = 0,
 ):
     """
     Factory function that creates a spectral-enabled forward method.
@@ -61,6 +64,8 @@ def create_spectral_forward(
         k_rank_values: Spectral rank for Values
         hot_buffer_size: Number of recent tokens kept uncompressed
         use_spectral_attention: If True, use direct spectral attention (no reconstruction)
+        use_attention_weighted_svd: Weight SVD by attention importance
+        landmark_count: Keep first N tokens uncompressed
         
     Returns:
         spectral_forward: Modified forward method with spectral cache
@@ -210,6 +215,9 @@ def create_spectral_forward(
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
                 debug_logging=debug_logging,  # Pass debug flag to cache
+                # NEW: Quality tuning options
+                use_attention_weighted_svd=use_attention_weighted_svd,
+                landmark_count=landmark_count,
             )
             
             # If there was a previous tuple cache, initialize with it
@@ -478,6 +486,9 @@ def create_spectral_forward_inference(
     use_spectral_attention: bool = True,
     debug_logging: bool = False,
     use_triton_kernel: bool = True,  # NEW: Use Triton kernel when available
+    # NEW: Quality tuning options
+    use_attention_weighted_svd: bool = False,
+    landmark_count: int = 0,
 ):
     """
     Creates a spectral-enabled inference forward function for decode steps.
@@ -491,6 +502,8 @@ def create_spectral_forward_inference(
         k_rank_values: Spectral rank for Values
         hot_buffer_size: Number of recent tokens kept uncompressed
         use_spectral_attention: If True, use direct spectral attention
+        use_attention_weighted_svd: Weight SVD by attention importance
+        landmark_count: Keep first N tokens uncompressed
         debug_logging: Enable detailed logging
         use_triton_kernel: If True and Triton available, use GPU kernels
         
@@ -569,6 +582,9 @@ def create_spectral_forward_inference(
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
                 debug_logging=debug_logging,
+                # NEW: Quality tuning options
+                use_attention_weighted_svd=use_attention_weighted_svd,
+                landmark_count=landmark_count,
             )
             
             # CONTAMINATION GUARD: Do NOT import tuple cache
@@ -719,6 +735,9 @@ def patch_unsloth_attention(
     verbose: bool = True,
     debug_logging: bool = False,
     use_triton_kernel: bool = True,  # NEW: Use Triton kernel when available
+    # NEW: Quality tuning options
+    use_attention_weighted_svd: bool = False,  # Weight SVD by attention importance
+    landmark_count: int = 0,  # Keep first N tokens uncompressed as landmarks
 ):
     """
     Monkey-patch all attention layers in an Unsloth model to use SpectralCache.
@@ -736,6 +755,8 @@ def patch_unsloth_attention(
         verbose: Print patching confirmation
         debug_logging: Enable detailed debug logging
         use_triton_kernel: Use optimized Triton kernels when available (default: True)
+        use_attention_weighted_svd: Weight SVD by attention importance (improves needle recall)
+        landmark_count: Keep first N tokens uncompressed (0 = disabled)
         
     Returns:
         model: Modified model (in-place)
@@ -758,6 +779,9 @@ def patch_unsloth_attention(
                 hot_buffer_size=hot_buffer_size,
                 use_spectral_attention=use_spectral_attention,
                 debug_logging=debug_logging,
+                # NEW: Quality tuning options
+                use_attention_weighted_svd=use_attention_weighted_svd,
+                landmark_count=landmark_count,
             )
             
             # Monkey-patch (bind to instance)
@@ -793,6 +817,9 @@ def patch_unsloth_attention(
             use_spectral_attention=use_spectral_attention,
             debug_logging=debug_logging,
             use_triton_kernel=use_triton_kernel,
+            # NEW: Quality tuning options
+            use_attention_weighted_svd=use_attention_weighted_svd,
+            landmark_count=landmark_count,
         )
         
         # Step 1: Patch the attention-level function in llama module

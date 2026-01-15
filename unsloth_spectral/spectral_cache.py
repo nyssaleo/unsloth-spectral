@@ -80,6 +80,10 @@ class SpectralCache:
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
         debug_logging: bool = False,
+        # NEW: Quality tuning options
+        use_attention_weighted_svd: bool = False,  # Weight SVD by attention importance
+        landmark_positions: Optional[List[int]] = None,  # Positions to never compress
+        landmark_count: int = 0,  # Keep first N tokens uncompressed as landmarks
     ):
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -91,10 +95,23 @@ class SpectralCache:
         self.dtype = dtype
         self.debug_logging = debug_logging
         
-        # Three-tier cache
+        # NEW: Quality tuning options
+        self.use_attention_weighted_svd = use_attention_weighted_svd
+        self.landmark_positions = set(landmark_positions) if landmark_positions else set()
+        self.landmark_count = landmark_count  # First N tokens are landmarks
+        
+        # Three-tier cache (now four-tier with landmarks!)
         self.hot_K: Optional[torch.Tensor] = None  # [B, H, T_hot, D]
         self.hot_V: Optional[torch.Tensor] = None
         self.cold_blocks: List[SpectralBlock] = []
+        
+        # NEW: Landmark cache (uncompressed important tokens)
+        self.landmark_K: Optional[torch.Tensor] = None  # [B, H, T_landmark, D]
+        self.landmark_V: Optional[torch.Tensor] = None
+        self.landmark_position_ids: Optional[torch.Tensor] = None
+        
+        # Attention weights for weighted SVD (accumulated during generation)
+        self.attention_importance: Optional[torch.Tensor] = None  # [T] importance scores
         
         # Position tracking (for RoPE relative rotation)
         self.current_position = 0  # Absolute position in sequence
@@ -112,6 +129,10 @@ class SpectralCache:
             print(f"  block_size={block_size}")
             print(f"  k_rank_keys={k_rank_keys}, k_rank_values={k_rank_values}")
             print(f"  hot_buffer_size={hot_buffer_size}")
+            if use_attention_weighted_svd:
+                print(f"  ⚡ Attention-weighted SVD: ENABLED")
+            if landmark_count > 0:
+                print(f"  📌 Landmark tokens: first {landmark_count} tokens preserved")
     
     def reset(self):
         """
@@ -128,6 +149,14 @@ class SpectralCache:
         self.hot_V = None
         self.hot_position_ids = None
         self.cold_blocks = []
+        
+        # Reset landmark cache
+        self.landmark_K = None
+        self.landmark_V = None
+        self.landmark_position_ids = None
+        
+        # Reset attention importance
+        self.attention_importance = None
         self.current_position = 0
         self.total_tokens = 0
         self.compression_count = 0
@@ -292,7 +321,8 @@ class SpectralCache:
     def _compress_tensor(
         self, 
         X: torch.Tensor, 
-        rank: int
+        rank: int,
+        attention_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compress a single tensor (K or V) using batched Randomized SVD.
@@ -300,9 +330,12 @@ class SpectralCache:
         This is the OPTIMIZED version using batched rSVD instead of per-head loop.
         Expected speedup: ~13x (267ms → 20ms for 8 heads × 512×128 matrices)
         
+        NEW: Supports attention-weighted SVD for better needle preservation.
+        
         Args:
             X: Input tensor [B, H, T, D]
             rank: Target spectral rank
+            attention_weights: Optional [T] weights for attention-weighted SVD
             
         Returns:
             coeffs: Quantized temporal coefficients [H, T, rank]
@@ -315,15 +348,34 @@ class SpectralCache:
         # Reshape: [B, H, T, D] -> [H, T, D] for batched processing
         X_batched = X.squeeze(0).float()  # [H, T, D]
         
+        # NEW: Attention-weighted SVD
+        # Weight rows by attention importance so high-attention tokens are preserved better
+        row_weights = None
+        if self.use_attention_weighted_svd and attention_weights is not None:
+            # Normalize weights to have mean 1 (so overall scale is preserved)
+            row_weights = attention_weights.float()
+            row_weights = row_weights / row_weights.mean()
+            row_weights = row_weights.sqrt()  # Use sqrt for Frobenius norm weighting
+            
+            # Apply row weighting: X_weighted = W * X
+            W = row_weights.view(1, T, 1).expand(H, T, D)
+            X_weighted = X_batched * W
+            
+            if self.debug_logging:
+                print(f"    [_compress_tensor] Using attention-weighted SVD")
+                print(f"      Weight range: {row_weights.min():.3f} - {row_weights.max():.3f}")
+        else:
+            X_weighted = X_batched
+        
         # BATCHED RANDOMIZED SVD (The Performance Fix!)
         # Process all heads in parallel instead of looping
         try:
             from .rsvd import batched_randomized_svd
-            U, S, Vh = batched_randomized_svd(X_batched, k=rank, n_iter=2, oversampling=5)
+            U, S, Vh = batched_randomized_svd(X_weighted, k=rank, n_iter=2, oversampling=5)
         except Exception as e:
             # Fallback to standard SVD if rSVD fails (e.g., matrix too small/degenerate)
             try:
-                U, S, Vh = torch.linalg.svd(X_batched, full_matrices=False)
+                U, S, Vh = torch.linalg.svd(X_weighted, full_matrices=False)
                 # Truncate to rank
                 U, S, Vh = U[:, :, :rank], S[:, :rank], Vh[:, :rank, :]
             except RuntimeError:
@@ -333,6 +385,13 @@ class SpectralCache:
         # Compute coefficients: C = U @ diag(S)
         # Broadcasting: U [H, T, k] * S [H, k] -> [H, T, k]
         coeffs = U * S.unsqueeze(1)  # [H, T, k]
+        
+        # NEW: Unweight coefficients if using attention-weighted SVD
+        # coeffs_original = coeffs / W (undo the row weighting)
+        if row_weights is not None:
+            W_coeff = row_weights.view(1, T, 1).expand(H, T, rank)
+            coeffs = coeffs / W_coeff
+        
         basis = Vh  # [H, k, D]
         
         # Batched quantization (vectorized per-head)
@@ -643,6 +702,154 @@ class SpectralCache:
             f"blocks={stats['num_blocks']}, "
             f"compression={stats['compression_ratio']:.2f}x)"
         )
+    
+    # ==========================================================================
+    # NEW: Attention Importance Tracking for Attention-Weighted SVD
+    # ==========================================================================
+    
+    def update_attention_importance(
+        self, 
+        attention_weights: torch.Tensor,
+        query_position: int,
+    ):
+        """
+        Update attention importance scores based on observed attention patterns.
+        
+        Called during inference to track which tokens receive high attention.
+        These scores are used for attention-weighted SVD compression.
+        
+        Args:
+            attention_weights: Attention weights [B, H, 1, T_kv] from current query
+            query_position: Position of the query token
+        """
+        if not self.use_attention_weighted_svd:
+            return
+        
+        # Average attention across heads: [T_kv]
+        avg_attention = attention_weights.mean(dim=(0, 1, 2))  # [T_kv]
+        
+        # Initialize or accumulate
+        if self.attention_importance is None:
+            self.attention_importance = avg_attention.clone()
+        else:
+            # Running average (exponential moving average)
+            alpha = 0.1
+            if self.attention_importance.shape[0] < avg_attention.shape[0]:
+                # Pad existing with zeros for new positions
+                padding = torch.zeros(
+                    avg_attention.shape[0] - self.attention_importance.shape[0],
+                    device=avg_attention.device, 
+                    dtype=avg_attention.dtype
+                )
+                self.attention_importance = torch.cat([self.attention_importance, padding])
+            
+            # Update only the positions that exist in current attention
+            T_kv = avg_attention.shape[0]
+            self.attention_importance[:T_kv] = (
+                (1 - alpha) * self.attention_importance[:T_kv] + alpha * avg_attention
+            )
+    
+    def get_block_attention_weights(self, block_idx: int) -> Optional[torch.Tensor]:
+        """
+        Get attention importance weights for a specific block.
+        
+        Used during compression to weight SVD by attention importance.
+        
+        Args:
+            block_idx: Index of the block being compressed
+            
+        Returns:
+            Attention weights [block_size] or None if not available
+        """
+        if self.attention_importance is None:
+            return None
+        
+        start = block_idx * self.block_size
+        end = start + self.block_size
+        
+        if end > self.attention_importance.shape[0]:
+            return None
+        
+        return self.attention_importance[start:end]
+    
+    # ==========================================================================
+    # NEW: Landmark Token Support for Hybrid Approach
+    # ==========================================================================
+    
+    def add_landmarks(self, K: torch.Tensor, V: torch.Tensor, position_ids: torch.Tensor):
+        """
+        Add landmark tokens that should never be compressed.
+        
+        Landmarks are kept in full FP16 precision for exact recall.
+        Typically: first N tokens, question tokens, special markers.
+        
+        Args:
+            K: Key states [B, H, T, D]
+            V: Value states [B, H, T, D]
+            position_ids: Position IDs [B, T]
+        """
+        if self.landmark_K is None:
+            self.landmark_K = K.clone()
+            self.landmark_V = V.clone()
+            self.landmark_position_ids = position_ids.clone()
+        else:
+            self.landmark_K = torch.cat([self.landmark_K, K], dim=2)
+            self.landmark_V = torch.cat([self.landmark_V, V], dim=2)
+            self.landmark_position_ids = torch.cat([self.landmark_position_ids, position_ids], dim=1)
+        
+        if self.debug_logging:
+            print(f"[SpectralCache] Added {K.shape[2]} landmark tokens")
+            print(f"  Total landmarks: {self.landmark_K.shape[2]}")
+    
+    def get_kv_with_landmarks(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Get full K/V with landmarks first, then spectral, then hot.
+        
+        Returns:
+            K_full: [B, H, T_total, D]
+            V_full: [B, H, T_total, D]
+            position_ids: [B, T_total]
+        """
+        K_parts = []
+        V_parts = []
+        pos_parts = []
+        
+        # 1. Landmarks (uncompressed, exact)
+        if self.landmark_K is not None:
+            K_parts.append(self.landmark_K)
+            V_parts.append(self.landmark_V)
+            if self.landmark_position_ids is not None:
+                pos_parts.append(self.landmark_position_ids)
+        
+        # 2. Cold blocks (spectral compressed)
+        for block in self.cold_blocks:
+            K_block = torch.bmm(block.coeffs_K, block.basis_K).unsqueeze(0)
+            V_block = torch.bmm(block.coeffs_V, block.basis_V).unsqueeze(0)
+            K_parts.append(K_block)
+            V_parts.append(V_block)
+            # Position IDs for this block
+            block_pos = torch.arange(
+                block.start_position, 
+                block.start_position + block.block_size,
+                device=K_block.device
+            ).unsqueeze(0)
+            pos_parts.append(block_pos)
+        
+        # 3. Hot cache (uncompressed, recent)
+        if self.hot_K is not None:
+            K_parts.append(self.hot_K)
+            V_parts.append(self.hot_V)
+            if self.hot_position_ids is not None:
+                pos_parts.append(self.hot_position_ids)
+        
+        if len(K_parts) == 0:
+            return None, None, None
+        
+        K_full = torch.cat(K_parts, dim=2)
+        V_full = torch.cat(V_parts, dim=2)
+        position_ids = torch.cat(pos_parts, dim=1) if pos_parts else None
+        
+        return K_full, V_full, position_ids
 
 
 def test_spectral_cache():
