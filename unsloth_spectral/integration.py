@@ -8,8 +8,12 @@ of standard tuple-based KV cache.
 Key Design: The patched forward method is a drop-in replacement that:
 1. Detects if past_key_value is a SpectralCache
 2. Converts tuple caches to SpectralCache automatically
-3. Uses spectral_attention_forward for computation
+3. Uses spectral_attention_forward for computation (PyTorch or Triton)
 4. Returns compatible outputs for model.generate()
+
+Triton Kernels:
+- When Triton is available, uses optimized GPU kernels for spectral attention
+- Auto-detects Triton and falls back to PyTorch if unavailable
 """
 
 import torch
@@ -18,6 +22,22 @@ from typing import Optional, Tuple
 from .spectral_cache import SpectralCache
 from .spectral_attention import spectral_attention_forward, apply_rope
 import math
+import logging
+
+# Module-level logger
+logger = logging.getLogger("unsloth_spectral.integration")
+
+# Check for Triton kernel availability
+TRITON_KERNELS_AVAILABLE = False
+try:
+    from .kernels import TRITON_AVAILABLE
+    if TRITON_AVAILABLE:
+        from .kernels import spectral_attention_decode, TritonSpectralConfig
+        TRITON_KERNELS_AVAILABLE = True
+        logger.info("Triton kernels available - will use GPU-accelerated spectral attention")
+except ImportError as e:
+    logger.debug(f"Triton kernels not available: {e}")
+    TRITON_AVAILABLE = False
 
 
 def create_spectral_forward(
@@ -457,6 +477,7 @@ def create_spectral_forward_inference(
     hot_buffer_size: int = 64,
     use_spectral_attention: bool = True,
     debug_logging: bool = False,
+    use_triton_kernel: bool = True,  # NEW: Use Triton kernel when available
 ):
     """
     Creates a spectral-enabled inference forward function for decode steps.
@@ -471,10 +492,21 @@ def create_spectral_forward_inference(
         hot_buffer_size: Number of recent tokens kept uncompressed
         use_spectral_attention: If True, use direct spectral attention
         debug_logging: Enable detailed logging
+        use_triton_kernel: If True and Triton available, use GPU kernels
         
     Returns:
         spectral_forward_inference: Modified inference function
     """
+    # Determine whether to use Triton kernels
+    _use_triton = use_triton_kernel and TRITON_KERNELS_AVAILABLE
+    
+    if debug_logging:
+        if _use_triton:
+            logger.info("[SpectralInference] Using TRITON kernels for spectral attention")
+        else:
+            logger.info("[SpectralInference] Using PyTorch for spectral attention")
+            if use_triton_kernel and not TRITON_KERNELS_AVAILABLE:
+                logger.warning("[SpectralInference] Triton requested but not available - falling back to PyTorch")
     
     def spectral_forward_inference(
         self,
@@ -583,16 +615,32 @@ def create_spectral_forward_inference(
             if debug_logging:
                 print(f"  Using spectral attention (total_tokens={past_key_value.total_tokens})")
                 print(f"  query_position: {query_position}")
+                print(f"  Backend: {'TRITON' if _use_triton else 'PyTorch'}")
             
-            attn_output = spectral_attention_forward(
-                Q=query_states,
-                cache=past_key_value,
-                cos=cos,
-                sin=sin,
-                query_position=query_position,
-                attention_mask=attention_mask,
-                scale=1.0 / math.sqrt(head_dim),
-            )
+            if _use_triton:
+                # Use optimized Triton kernel
+                triton_config = TritonSpectralConfig(enable_logging=debug_logging)
+                attn_output = spectral_attention_decode(
+                    Q=query_states,
+                    cache=past_key_value,
+                    cos=cos,
+                    sin=sin,
+                    query_position=query_position,
+                    attention_mask=attention_mask,
+                    scale=1.0 / math.sqrt(head_dim),
+                    config=triton_config,
+                )
+            else:
+                # Use PyTorch implementation
+                attn_output = spectral_attention_forward(
+                    Q=query_states,
+                    cache=past_key_value,
+                    cos=cos,
+                    sin=sin,
+                    query_position=query_position,
+                    attention_mask=attention_mask,
+                    scale=1.0 / math.sqrt(head_dim),
+                )
         else:
             # Standard attention with reconstructed K/V
             if debug_logging:
@@ -670,6 +718,7 @@ def patch_unsloth_attention(
     use_spectral_attention: bool = True,
     verbose: bool = True,
     debug_logging: bool = False,
+    use_triton_kernel: bool = True,  # NEW: Use Triton kernel when available
 ):
     """
     Monkey-patch all attention layers in an Unsloth model to use SpectralCache.
@@ -685,6 +734,8 @@ def patch_unsloth_attention(
         hot_buffer_size: Recent tokens kept uncompressed
         use_spectral_attention: Use direct spectral attention (recommended: True)
         verbose: Print patching confirmation
+        debug_logging: Enable detailed debug logging
+        use_triton_kernel: Use optimized Triton kernels when available (default: True)
         
     Returns:
         model: Modified model (in-place)
@@ -727,6 +778,7 @@ def patch_unsloth_attention(
             hot_buffer_size=hot_buffer_size,
             use_spectral_attention=use_spectral_attention,
             debug_logging=debug_logging,
+            use_triton_kernel=use_triton_kernel,  # Pass through Triton flag
         )
         
         # Monkey-patch the module-level function

@@ -77,6 +77,21 @@ from .spectral_cache import SpectralCache, SpectralBlock
 from .spectral_attention import spectral_attention_forward, validate_spectral_attention
 from .integration import patch_unsloth_attention, get_cache_stats
 
+# Triton kernel exports (conditional)
+try:
+    from .kernels import (
+        TRITON_AVAILABLE,
+        TRITON_VERSION,
+    )
+    if TRITON_AVAILABLE:
+        from .kernels import (
+            spectral_attention_decode,
+            TritonSpectralConfig,
+        )
+except ImportError:
+    TRITON_AVAILABLE = False
+    TRITON_VERSION = None
+
 __all__ = [
     "SpectralCache",
     "SpectralBlock",
@@ -84,7 +99,13 @@ __all__ = [
     "validate_spectral_attention",
     "patch_unsloth_attention",
     "get_cache_stats",
+    "TRITON_AVAILABLE",
+    "TRITON_VERSION",
 ]
+
+# Add Triton exports if available
+if TRITON_AVAILABLE:
+    __all__.extend(["spectral_attention_decode", "TritonSpectralConfig"])
 
 
 def print_banner():
@@ -96,6 +117,10 @@ def print_banner():
     print("  📉 7-15x Memory Compression")
     print("  ⚡ ~8x Attention Speedup (long contexts)")
     print("  ✅ >97% Attention Fidelity")
+    if TRITON_AVAILABLE:
+        print(f"  🚀 Triton v{TRITON_VERSION} - GPU Kernels ENABLED")
+    else:
+        print("  ⚙️  PyTorch Backend - Triton not available")
     print("=" * 70)
 
 
