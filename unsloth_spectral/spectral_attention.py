@@ -285,7 +285,9 @@ def spectral_attention_forward(
         scores = scores.masked_fill(attention_mask == 0, float('-inf'))
     
     # Softmax
-    attn_weights = F.softmax(scores, dim=-1)  # [B, H, 1, T_total]
+    # CRITICAL: Compute softmax in FP32 to prevent exp() overflow!
+    # With scores up to ±26 after scaling, exp(26) overflows FP16 (max 65504)
+    attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)  # [B, H, 1, T_total]
     
     # PHASE 2: Compute Weighted Values
     # ==================================
@@ -378,7 +380,7 @@ def validate_spectral_attention(
     
     # Standard attention (reference)
     scores_ref = torch.matmul(Q, K.transpose(-2, -1)) * scale  # [B, H, 1, T]
-    attn_ref = F.softmax(scores_ref, dim=-1)
+    attn_ref = F.softmax(scores_ref, dim=-1, dtype=torch.float32).to(scores_ref.dtype)
     output_ref = torch.matmul(attn_ref, V)  # [B, H, 1, D]
     
     # Spectral attention (test)

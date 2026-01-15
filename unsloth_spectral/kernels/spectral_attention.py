@@ -799,7 +799,10 @@ def spectral_attention_decode(
     if attention_mask is not None:
         scores = scores.masked_fill(attention_mask == 0, float('-inf'))
     
-    attn_weights = F.softmax(scores, dim=-1)  # [B, H_q, 1, T_total]
+    # CRITICAL: Compute softmax in FP32 to prevent exp() overflow!
+    # Scores can reach ±26 after scaling, and exp(26) ≈ 5×10^11 overflows FP16 (max 65504)
+    # This causes Inf → NaN cascade that corrupts the entire model
+    attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(scores.dtype)  # [B, H_q, 1, T_total]
     
     if config.enable_logging:
         logger.debug(f"[PHASE2] Softmax applied: attn_sum={attn_weights.sum(dim=-1).mean():.4f}")
