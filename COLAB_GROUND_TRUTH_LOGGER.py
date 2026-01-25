@@ -51,9 +51,14 @@ from unsloth import FastLanguageModel
 MODEL_NAME = "unsloth/mistral-7b-instruct-v0.3-bnb-4bit"
 MAX_SEQ_LENGTH = 8192
 
-# Short prompt to keep logging manageable
-TEST_PROMPT = """Context: The secret code is ALPHA-123. 
-Question: What is the secret code?
+# Use a proper prompt that actually tests long-context recall
+TEST_PROMPT = """You are a helpful AI assistant. Please answer the following question accurately.
+
+Context: In the field of quantum computing, qubits are the fundamental units of information. Unlike classical bits which can only be 0 or 1, qubits can exist in superposition states. This property, combined with entanglement, gives quantum computers their power. The secret research code for our quantum project is QUANTUM-ALPHA-9527. This code must be remembered for later reference.
+
+Additional context: Quantum algorithms like Shor's algorithm and Grover's algorithm demonstrate exponential speedups over classical algorithms. The development of error correction techniques is crucial for building practical quantum computers. Current quantum computers are in the NISQ (Noisy Intermediate-Scale Quantum) era.
+
+Question: What is the secret research code mentioned in the context above?
 Answer:"""
 
 # =============================================================================
@@ -123,7 +128,11 @@ class GenerationLogger:
         # Final output
         full_output = "".join([e['data']['token_text'] for e in token_events])
         print(f"\n📝 Full Output: {full_output}")
-        print(f"🎯 Needle 'ALPHA-123': {'✅ Found' if 'ALPHA-123' in full_output else '❌ Not found'}")
+        print(f"🎯 Needle 'QUANTUM-ALPHA-9527': {'✅ Found' if 'QUANTUM-ALPHA-9527' in full_output else '❌ Not found'}")
+        
+        # Hallucination check
+        if "cold" in full_output.lower() and "hot start" in full_output.lower():
+            print(f"⚠️ HALLUCINATION: Model generated unrelated content about 'cold/hot start'!")
         
         return full_output
 
@@ -510,9 +519,35 @@ def main():
     print(f"\n{'='*70}")
     print("🎯 NEEDLE RECALL SUMMARY")
     print(f"{'='*70}")
-    print(f"Pure Baseline:         {'✅ Found' if 'ALPHA-123' in output1 else '❌ Not found'}")
-    print(f"Contaminated Baseline: {'✅ Found' if 'ALPHA-123' in output2 else '❌ Not found'}")
-    print(f"Spectral Patched:      {'✅ Found' if 'ALPHA-123' in output3 else '❌ Not found'}")
+    needle_1 = 'QUANTUM-ALPHA-9527' in output1
+    needle_2 = 'QUANTUM-ALPHA-9527' in output2
+    needle_3 = 'QUANTUM-ALPHA-9527' in output3
+    
+    halluc_1 = "cold" in output1.lower() and "hot" in output1.lower()
+    halluc_2 = "cold" in output2.lower() and "hot" in output2.lower()
+    halluc_3 = "cold" in output3.lower() and "hot" in output3.lower()
+    
+    print(f"Pure Baseline:         {'✅ Recalled' if needle_1 else '❌ Failed'}{' ⚠️ HALLUCINATED' if halluc_1 else ''}")
+    print(f"Contaminated Baseline: {'✅ Recalled' if needle_2 else '❌ Failed'}{' ⚠️ HALLUCINATED' if halluc_2 else ''}")
+    print(f"Spectral Patched:      {'✅ Recalled' if needle_3 else '❌ Failed'}{' ⚠️ HALLUCINATED' if halluc_3 else ''}")
+    
+    print(f"\n{'='*70}")
+    print("📊 INTERPRETATION")
+    print(f"{'='*70}")
+    
+    if needle_1 and needle_2 and needle_3:
+        print("✅ All scenarios work - no issues detected")
+    elif needle_3 and not needle_1:
+        print("🎯 SPECTRAL IS BETTER! It recalls when baseline fails!")
+        print("   This suggests our implementation improves context handling.")
+    elif needle_1 and not needle_3:
+        print("⚠️ SPECTRAL IS WORSE! Baseline works but spectral fails!")
+        print("   This suggests a bug in our implementation.")
+    elif halluc_1 or halluc_2:
+        print("⚠️ BASELINE HALLUCINATES! This is the key finding from original test.")
+        print("   Baseline generates unrelated content instead of recalling needle.")
+    else:
+        print("❓ Inconclusive - need to investigate further.")
 
 if __name__ == "__main__":
     main()
